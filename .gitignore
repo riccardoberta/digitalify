@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Generated VHDL output
+generated_vhdl/
+vhdl_out/
+
+# Vivado API — runtime artefacts
+vivado_api/.env
+vivado_api/vivado_api/        # workspace dir if placed inside repo
+*.jou                         # Vivado journal files
+*.log                         # Vivado log files (keep source logs out of VCS)
+*.dcp                         # Vivado design checkpoints (large binary)
+*.wdb                         # xsim waveform database
+*.pb                          # Vivado project backup
+*.str
+.Xil/                         # Vivado scratch directory
+
+# Distribution / packaging
+*.whl
+*.tar.gz
+MANIFEST
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
