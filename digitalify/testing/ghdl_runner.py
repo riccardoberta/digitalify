@@ -18,6 +18,7 @@ Typical usage
 from __future__ import annotations
 
 import dataclasses
+import os
 import re
 import shutil
 import subprocess
@@ -61,8 +62,28 @@ class GHDLResult:
         status = "PASSED" if self.passed else "FAILED"
         return (
             f"[{status}]  {self.n_passed} passed, {self.n_failed} failed"
-            + (f"  — VCD: {self.vcd_path}" if self.vcd_path else "")
+            + (f"  (VCD: {self.vcd_path})" if self.vcd_path else "")
         )
+
+
+# ---------------------------------------------------------------------------
+# GHDL discovery
+# ---------------------------------------------------------------------------
+
+def find_ghdl(ghdl_path: str | None = None) -> str:
+    """Resolve the GHDL executable.
+
+    Order: explicit *ghdl_path*, the ``DIGITALIFY_GHDL`` environment variable,
+    ``ghdl`` on PATH.  Raises ``FileNotFoundError`` if none is usable.
+    """
+    candidate = ghdl_path or os.environ.get("DIGITALIFY_GHDL") or "ghdl"
+    resolved = shutil.which(candidate) or (candidate if Path(candidate).is_file() else None)
+    if resolved is None:
+        raise FileNotFoundError(
+            f"GHDL executable not found ('{candidate}'). Install GHDL >= 3.0 and put it on "
+            "PATH, set DIGITALIFY_GHDL, or pass ghdl_path=..."
+        )
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -161,11 +182,11 @@ def run_ghdl(
     tb_filename: str,
     tb_source: str,
     tb_entity: str,
-    ghdl_path: str = "ghdl",
+    ghdl_path: str | None = None,
     work_dir: Path | None = None,
     keep_work_dir: bool = False,
     vcd: bool = True,
-    stop_time: str = "10us",
+    stop_time: str = "1ms",
 ) -> GHDLResult:
     """
     Run a full GHDL analyze → elaborate → simulate cycle.
@@ -182,8 +203,9 @@ def run_ghdl(
     tb_entity : str
         Name of the testbench entity to elaborate and run
         (e.g. ``"tb_mlp"``).
-    ghdl_path : str
-        Name or full path of the GHDL executable.
+    ghdl_path : str or None
+        Name or full path of the GHDL executable.  ``None`` uses the
+        ``DIGITALIFY_GHDL`` environment variable, then ``ghdl`` on PATH.
     work_dir : Path | None
         Directory for intermediate files.  A unique temporary directory is
         created when ``None``; it is deleted after the run unless
@@ -194,7 +216,7 @@ def run_ghdl(
     vcd : bool
         Dump a VCD waveform to ``{work_dir}/waveform.vcd``.
     stop_time : str
-        Simulation stop-time safety limit (e.g. ``"10us"``).  The testbench
+        Simulation stop-time safety limit (e.g. ``"1ms"``).  The testbench
         terminates naturally before this; the limit is a fallback only.
 
     Returns
@@ -202,6 +224,8 @@ def run_ghdl(
     GHDLResult
         Structured result with pass/fail counts, log, and VCD path.
     """
+    ghdl_path = find_ghdl(ghdl_path)
+
     # ── Working directory setup ───────────────────────────────────────────────
     tmp_dir: str | None = None
     if work_dir is None:
@@ -259,7 +283,9 @@ def run_ghdl(
         passed = (rc == 0) and (n_failed == 0) and (n_passed > 0)
 
         vcd_path = work_dir / "waveform.vcd"
-        vcd_path = vcd_path if (vcd and vcd_path.exists()) else None
+        # A VCD inside a temporary directory is deleted below, so don't report it.
+        kept = keep_work_dir or tmp_dir is None
+        vcd_path = vcd_path if (vcd and kept and vcd_path.exists()) else None
 
         return GHDLResult(
             passed=passed,

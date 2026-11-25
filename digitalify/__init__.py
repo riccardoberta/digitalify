@@ -1,136 +1,100 @@
 """
-digitalify — ML-to-VHDL synthesis library.
+digitalify — QONNX-to-VHDL synthesis library.
 
-Translates quantized neural-network models (expressed as operator-level
-torch.fx graphs) into fully synthesisable structural VHDL descriptions.
+Translates quantised neural networks expressed in QONNX (as exported by
+Brevitas ``export_qonnx``, converted from QKeras, or built by hand) into
+fully synthesisable, bit-exact structural VHDL.
 
-Quick start — synthesis
------------------------
->>> import torch, torch.nn as nn, torch.fx as fx, digitalify
->>> model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
->>> gm    = fx.symbolic_trace(model)
->>> files = digitalify.convert(gm, input_shape=(4,))
-
-Quick start — GHDL simulation
-------------------------------
->>> result = digitalify.simulate(gm, input_shape=(4,))
->>> print(result.summary())
-[PASSED]  8 passed, 0 failed
+Quick start
+-----------
+>>> import digitalify
+>>> files  = digitalify.convert("model.onnx", output_dir="vhdl_out/")
+>>> check  = digitalify.verify("model.onnx")      # integer model vs QONNX
+>>> sim    = digitalify.simulate("model.onnx")    # VHDL vs integer model (GHDL)
+>>> print(check.summary(), sim.summary(), sep="\\n")
 """
 
-from digitalify.frontend.torch_importer import from_fx_graph
+from __future__ import annotations
+
 from digitalify.backend.vhdl.generator import VHDLGenerator
-from digitalify.exceptions import UnsupportedOperatorError, VHDLGenerationError
+from digitalify.exceptions import (
+    QONNXImportError,
+    UnsupportedOperatorError,
+    VHDLGenerationError,
+)
+from digitalify.frontend.qonnx_importer import from_qonnx, load_qonnx
+from digitalify.ir import IntType, IRGraph, IRNode
+from digitalify.verify import VerificationResult, verify
 
 
-def convert(
-    graph_module,
-    input_shape: tuple,
-    data_width: int = 8,
-    output_dir: str | None = None,
-) -> dict[str, str]:
+def convert(model, output_dir: str | None = None, name: str | None = None) -> dict[str, str]:
     """
-    High-level entry point: trace → IR → VHDL.
+    High-level entry point: QONNX → IR → VHDL.
 
     Parameters
     ----------
-    graph_module : torch.fx.GraphModule
-        The (possibly quantized) model after symbolic tracing.
-    input_shape : tuple
-        Shape of one input sample, e.g. ``(784,)`` or ``(4,)``.
-    data_width : int
-        Bit-width used for fixed-point arithmetic (default 8 → INT8).
+    model : str | os.PathLike | onnx.ModelProto | qonnx ModelWrapper | IRGraph
+        The quantised network (or an already imported IRGraph).
     output_dir : str or None
-        If given, generated VHDL files are also written to this directory.
+        If given, the VHDL files are also written to this directory.
+    name : str or None
+        Prefix for the VHDL entities (defaults to the ONNX graph name).
 
     Returns
     -------
     dict[str, str]
-        Mapping from filename (e.g. ``"linear_0.vhd"``) to VHDL source.
+        ``{filename: vhdl_source}``; the top level is ``<name>_top.vhd``.
     """
-    ir_graph = from_fx_graph(graph_module, input_shape=input_shape)
-    generator = VHDLGenerator(data_width=data_width)
-    files = generator.generate(ir_graph)
+    ir = model if isinstance(model, IRGraph) else from_qonnx(model, name=name)
+    files = VHDLGenerator().generate(ir)
 
     if output_dir is not None:
         import os
         os.makedirs(output_dir, exist_ok=True)
         for fname, content in files.items():
-            with open(os.path.join(output_dir, fname), "w") as fh:
+            with open(os.path.join(output_dir, fname), "w", encoding="utf-8") as fh:
                 fh.write(content)
-
     return files
 
 
 def simulate(
-    graph_module,
-    input_shape: tuple,
-    data_width: int = 8,
-    n_vectors: int = 8,
+    model,
+    n_vectors: int = 16,
     seed: int = 42,
-    ghdl_path: str = "ghdl",
+    ghdl_path: str | None = None,
     work_dir: str | None = None,
     keep_work_dir: bool = False,
-    vcd: bool = True,
+    vcd: bool = False,
+    name: str | None = None,
 ):
     """
-    Full pipeline: trace → IR → VHDL → testbench → GHDL simulation.
+    QONNX → VHDL → self-checking testbench → GHDL simulation.
 
-    Generates random INT8 test vectors, computes expected outputs with the
-    Python reference model, produces a self-checking VHDL testbench, and
-    runs it through GHDL.  Requires GHDL ≥ 3.0 installed and on PATH
-    (or pass its full path via ``ghdl_path``).
-
-    Parameters
-    ----------
-    graph_module : torch.fx.GraphModule
-        The traced model.
-    input_shape : tuple
-        Shape of one input sample (batch dim excluded), e.g. ``(16,)``.
-    data_width : int
-        Activation bit-width (must match the synthesis step).
-    n_vectors : int
-        Number of test vectors (first three are always edge-cases).
-    seed : int
-        RNG seed for random test vectors.
-    ghdl_path : str
-        Name or full path of the GHDL executable (default: ``"ghdl"``).
-    work_dir : str or None
-        Directory for intermediate GHDL files.  A temporary directory is
-        created and cleaned up automatically when ``None``.
-    keep_work_dir : bool
-        Keep the working directory after the run (useful for inspecting
-        generated files or loading the VCD into GTKWave).
-    vcd : bool
-        Dump a VCD waveform to ``{work_dir}/waveform.vcd``.
+    The testbench compares the VHDL against the bit-exact integer reference
+    model; use :func:`verify` to compare that reference with the original
+    QONNX model.  Requires GHDL ≥ 3.0 (on PATH, in ``DIGITALIFY_GHDL``, or
+    passed as ``ghdl_path``).
 
     Returns
     -------
     GHDLResult
-        Dataclass with ``passed``, ``n_passed``, ``n_failed``, ``log``,
-        ``vcd_path``, and ``work_dir``.  Call ``.summary()`` for a
-        one-line status string.
+        ``passed``, ``n_passed``, ``n_failed``, ``log``, ``vcd_path``,
+        ``work_dir``; ``.summary()`` gives a one-line status.
     """
     from pathlib import Path
-    from digitalify.testing.tb_generator import generate_testbench
+
     from digitalify.testing.ghdl_runner import run_ghdl
+    from digitalify.testing.tb_generator import generate_testbench
 
-    ir_graph = from_fx_graph(graph_module, input_shape=input_shape)
-    vhdl_files = VHDLGenerator(data_width=data_width).generate(ir_graph)
-
-    tb_filename, tb_source = generate_testbench(
-        ir_graph,
-        n_vectors=n_vectors,
-        data_width=data_width,
-        seed=seed,
-    )
-    tb_entity = f"tb_{ir_graph.name}"
+    ir = model if isinstance(model, IRGraph) else from_qonnx(model, name=name)
+    vhdl_files = VHDLGenerator().generate(ir)
+    tb_filename, tb_source = generate_testbench(ir, n_vectors=n_vectors, seed=seed)
 
     return run_ghdl(
         vhdl_files=vhdl_files,
         tb_filename=tb_filename,
         tb_source=tb_source,
-        tb_entity=tb_entity,
+        tb_entity=f"tb_{ir.name}",
         ghdl_path=ghdl_path,
         work_dir=Path(work_dir) if work_dir else None,
         keep_work_dir=keep_work_dir,
@@ -141,8 +105,15 @@ def simulate(
 __all__ = [
     "convert",
     "simulate",
-    "from_fx_graph",
+    "verify",
+    "from_qonnx",
+    "load_qonnx",
     "VHDLGenerator",
+    "IRGraph",
+    "IRNode",
+    "IntType",
+    "VerificationResult",
     "UnsupportedOperatorError",
+    "QONNXImportError",
     "VHDLGenerationError",
 ]

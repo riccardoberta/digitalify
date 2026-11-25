@@ -3,118 +3,80 @@ VHDL backend generator.
 
 Given an ``IRGraph``, the generator:
 
-1. Allocates one ``VHDLOperator`` handler per node (looked up from
-   ``OPERATOR_REGISTRY``; raises ``UnsupportedOperatorError`` for unknowns).
-2. Emits one ``.vhd`` file per computation node  (the component entity +
-   architecture with hardcoded weights).
-3. Emits a top-level ``<graph_name>_top.vhd`` that instantiates every
-   component in order and wires them together with intermediate signals.
+1. Looks up one ``VHDLOperator`` handler per node in ``OPERATOR_REGISTRY``
+   (``UnsupportedOperatorError`` for unknown op types).
+2. Emits one ``<graph>_<node>.vhd`` file per node (entity + architecture
+   with the constants baked in).
+3. Emits ``<graph>_top.vhd``, a structural entity that instantiates every
+   component and wires them following ``IRNode.input_names``.
 
-Signal naming convention inside the top-level:
-    sig_<node_name>_data   — activation bus leaving that node
-    sig_<node_name>_valid  — handshake valid bit leaving that node
-The network input uses ``data_i`` / ``valid_i`` directly.
+Entity names are prefixed with the graph name so that several networks can
+live in the same VHDL library.
 """
 
 from __future__ import annotations
 
+from digitalify.exceptions import UnsupportedOperatorError, VHDLGenerationError
 from digitalify.ir.graph import IRGraph
 from digitalify.ir.node import IRNode
-from digitalify.operators.registry import OPERATOR_REGISTRY
 from digitalify.operators.base import VHDLOperator
-from digitalify.exceptions import UnsupportedOperatorError, VHDLGenerationError
+from digitalify.operators.registry import OPERATOR_REGISTRY
 
 
 class VHDLGenerator:
-    """
-    Converts an ``IRGraph`` into a set of synthesisable VHDL source files.
-
-    Parameters
-    ----------
-    data_width : int
-        Bit-width used for activations and weights (default 8 → INT8).
-    acc_width : int
-        Bit-width of the internal MAC accumulator (default 32).
-    """
-
-    def __init__(self, data_width: int = 8, acc_width: int = 32) -> None:
-        self.data_width = data_width
-        self.acc_width = acc_width
-
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
+    """Converts an ``IRGraph`` into synthesisable VHDL-2008 source files."""
 
     def generate(self, ir: IRGraph) -> dict[str, str]:
         """
-        Generate all VHDL source files for *ir*.
-
         Returns
         -------
         dict[str, str]
-            Mapping ``{filename: vhdl_source}``.  The filename for the
-            top-level entity is ``<ir.name>_top.vhd``; each component
-            file is ``<node_name>.vhd``.
-
-        Raises
-        ------
-        UnsupportedOperatorError
-            If a node's ``op_type`` has no registered handler.
-        VHDLGenerationError
-            If the graph is empty or shapes are inconsistent.
+            ``{filename: vhdl_source}``, components first (in dependency
+            order) and ``<ir.name>_top.vhd`` last.
         """
         if not ir.nodes:
             raise VHDLGenerationError("IRGraph is empty — nothing to generate.")
 
+        handlers = {node.name: self._handler(node) for node in ir.nodes}
         files: dict[str, str] = {}
-        handlers: dict[str, VHDLOperator] = {}
-
-        # ---- Per-component files ----
         for node in ir.nodes:
-            handler = self._get_handler(node)
-            handlers[node.name] = handler
-            files[f"{node.name}.vhd"] = handler.component_architecture(node)
-
-        # ---- Top-level structural file ----
+            files[f"{self.entity_name(ir, node)}.vhd"] = handlers[node.name].architecture(
+                node, self.entity_name(ir, node)
+            )
         files[f"{ir.name}_top.vhd"] = self._top_level(ir, handlers)
-
         return files
 
-    # ------------------------------------------------------------------
-    # Handler lookup
-    # ------------------------------------------------------------------
+    @staticmethod
+    def entity_name(ir: IRGraph, node: IRNode) -> str:
+        return f"{ir.name}_{node.name}"
 
-    def _get_handler(self, node: IRNode) -> VHDLOperator:
+    @staticmethod
+    def latency(ir: IRGraph) -> int:
+        """Clock cycles from ``valid_i`` to ``valid_o`` along the chain."""
+        return sum(OPERATOR_REGISTRY[n.op_type].latency for n in ir.nodes)
+
+    @staticmethod
+    def _handler(node: IRNode) -> VHDLOperator:
         cls = OPERATOR_REGISTRY.get(node.op_type)
         if cls is None:
-            raise UnsupportedOperatorError(
-                op_type=node.op_type, node_name=node.name
-            )
-        return cls(data_width=self.data_width, acc_width=self.acc_width)
+            raise UnsupportedOperatorError(op_type=node.op_type, node_name=node.name)
+        return cls()
 
-    # ------------------------------------------------------------------
-    # Top-level VHDL assembly
-    # ------------------------------------------------------------------
+    def _top_level(self, ir: IRGraph, handlers: dict[str, VHDLOperator]) -> str:
+        in_bits = ir.in_features * ir.input_dtype.bits
+        out_bits = ir.out_features * ir.output_dtype.bits
+        top = f"{ir.name}_top"
 
-    def _top_level(
-        self, ir: IRGraph, handlers: dict[str, VHDLOperator]
-    ) -> str:
-        dw = self.data_width
-        in_bits = ir.input_shape[-1] * dw
-        out_bits = ir.output_shape[-1] * dw
-
-        # ---- Header ----
         src = (
+            f"-- Top-level structural entity for '{ir.name}'\n"
+            f"-- Input : {ir.in_features} x {ir.input_dtype}  (real = q * {ir.input_scale:g})\n"
+            f"-- Output: {ir.out_features} x {ir.output_dtype}\n"
+            f"-- Latency: {self.latency(ir)} clock cycle(s)\n"
+            "-- Generated by digitalify\n\n"
             "library ieee;\n"
             "use ieee.std_logic_1164.all;\n"
             "use ieee.numeric_std.all;\n\n"
-        )
-
-        # ---- Entity ----
-        src += (
-            f"-- Top-level structural entity for '{ir.name}'\n"
-            f"-- Generated by digitalify\n\n"
-            f"entity {ir.name}_top is\n"
+            f"entity {top} is\n"
             "    port (\n"
             "        clk     : in  std_logic;\n"
             "        rst     : in  std_logic;\n"
@@ -123,61 +85,40 @@ class VHDLGenerator:
             "        valid_o : out std_logic;\n"
             f"        data_o  : out std_logic_vector({out_bits - 1} downto 0)\n"
             "    );\n"
-            f"end entity {ir.name}_top;\n\n"
+            f"end entity {top};\n\n"
+            f"architecture structural of {top} is\n\n"
+            "    -- Component declarations\n"
         )
-
-        # ---- Architecture declarative region ----
-        src += f"architecture structural of {ir.name}_top is\n\n"
-
-        # Component declarations
-        src += "    -- Component declarations\n"
         for node in ir.nodes:
-            src += handlers[node.name].component_declaration(node) + "\n\n"
+            src += handlers[node.name].component_declaration(node, self.entity_name(ir, node)) + "\n\n"
 
-        # Intermediate signal declarations
-        src += "    -- Intermediate signals\n"
+        src += "    -- Inter-stage signals\n"
         for node in ir.nodes:
-            bits = node.out_features * dw
-            src += (
-                f"    signal sig_{node.name}_data  : "
-                f"std_logic_vector({bits - 1} downto 0);\n"
-                f"    signal sig_{node.name}_valid : std_logic;\n"
-            )
-
+            bits = node.out_features * node.output_dtype.bits
+            src += (f"    signal {node.name}_data  : std_logic_vector({bits - 1} downto 0);\n"
+                    f"    signal {node.name}_valid : std_logic;\n")
         src += "\nbegin\n\n"
 
-        # ---- Instantiations ----
-        src += "    -- Component instantiations\n"
-        for idx, node in enumerate(ir.nodes):
-            # Determine input signal for this node
-            if idx == 0:
-                sig_in = "data_i"
-                sig_valid_in = "valid_i"
-            else:
-                prev_node = ir.nodes[idx - 1]
-                sig_in = f"sig_{prev_node.name}_data"
-                sig_valid_in = f"sig_{prev_node.name}_valid"
+        def source(name: str) -> tuple[str, str]:
+            return ("data_i", "valid_i") if name == "__input__" else (f"{name}_data", f"{name}_valid")
 
-            # All nodes write to intermediate signals; the last one is
-            # connected to the top-level output ports by concurrent assignment.
-            sig_out       = f"sig_{node.name}_data"
-            sig_valid_out = f"sig_{node.name}_valid"
-
+        known = {"__input__"}
+        for node in ir.nodes:
+            if len(node.input_names) != 1 or node.input_names[0] not in known:
+                raise VHDLGenerationError(
+                    f"Node '{node.name}' has inputs {node.input_names}; expected one earlier node."
+                )
+            data_in, valid_in = source(node.input_names[0])
             src += handlers[node.name].instantiation(
-                node,
-                signal_in=sig_in,
-                signal_out=sig_out,
-                signal_valid_in=sig_valid_in,
-                signal_valid_out=sig_valid_out,
+                node, self.entity_name(ir, node), data_in, valid_in,
+                f"{node.name}_data", f"{node.name}_valid",
             ) + "\n\n"
+            known.add(node.name)
 
-        # Wire last node's output to the top-level ports
-        last_node = ir.nodes[-1]
+        last = ir.nodes[-1].name
         src += (
-            "    -- Connect last stage to top-level output ports\n"
-            f"    data_o  <= sig_{last_node.name}_data;\n"
-            f"    valid_o <= sig_{last_node.name}_valid;\n\n"
+            "    data_o  <= " + f"{last}_data;\n"
+            "    valid_o <= " + f"{last}_valid;\n\n"
+            "end architecture structural;\n"
         )
-
-        src += f"end architecture structural;\n"
         return src
