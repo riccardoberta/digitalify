@@ -1,80 +1,104 @@
 """
 Abstract base class for VHDL operator handlers.
 
-Each supported operator type (linear, relu, …) provides a concrete
-subclass that knows how to emit synthesisable VHDL for that operation.
+Each supported IR op type provides a concrete subclass that emits
+synthesisable VHDL-2008 for one IRNode.  Every component has the same
+streaming interface:
 
-A handler must implement three methods:
-  - ``component_declaration``  – the reusable ``component`` block used
-                                 inside the top-level architecture.
-  - ``component_architecture`` – the self-contained entity + architecture
-                                 written to its own .vhd file.
-  - ``instantiation``          – the ``port map`` statement that wires
-                                 one instance into the top-level.
+    clk, rst            (only for registered components)
+    valid_i, data_i     input handshake + packed input bus
+    valid_o, data_o     output handshake + packed output bus
+
+Bus packing: element ``i`` of a bus whose element type has ``B`` bits
+occupies ``data((i+1)*B-1 downto i*B)``.
 """
 
 from __future__ import annotations
+
 from abc import ABC, abstractmethod
+
 from digitalify.ir.node import IRNode
 
 
 class VHDLOperator(ABC):
-    """
-    Abstract handler for one operator type.
+    """Abstract handler for one operator type."""
 
-    Parameters
-    ----------
-    data_width : int
-        Bit-width of every activation and weight sample (default 8).
-    acc_width : int
-        Bit-width of the internal accumulator register (default 32).
-    """
+    #: Number of clock cycles from valid_i to valid_o.
+    latency: int = 0
 
-    def __init__(self, data_width: int = 8, acc_width: int = 32) -> None:
-        self.data_width = data_width
-        self.acc_width = acc_width
-
-    # ------------------------------------------------------------------
-    # Interface that every handler must implement
-    # ------------------------------------------------------------------
+    #: Whether the component has clk / rst ports.
+    clocked: bool = False
 
     @abstractmethod
-    def component_declaration(self, node: IRNode) -> str:
-        """
-        Return the VHDL ``component`` block for use inside another
-        architecture's declarative region.
-        """
-
-    @abstractmethod
-    def component_architecture(self, node: IRNode) -> str:
-        """
-        Return the complete VHDL source (library clauses + entity +
-        architecture) for a standalone ``.vhd`` file.
-        """
-
-    @abstractmethod
-    def instantiation(
-        self,
-        node: IRNode,
-        signal_in: str,
-        signal_out: str,
-        signal_valid_in: str,
-        signal_valid_out: str,
-    ) -> str:
-        """
-        Return the component instantiation statement (``port map``) that
-        connects ``signal_in`` / ``signal_out`` to this component instance
-        inside the top-level architecture.
-        """
+    def architecture(self, node: IRNode, entity: str) -> str:
+        """Complete VHDL source (library clauses + entity + architecture)."""
 
     # ------------------------------------------------------------------
-    # Shared VHDL header (library + use clauses)
+    # Shared helpers
     # ------------------------------------------------------------------
+
+    def ports(self, node: IRNode) -> str:
+        in_bits = node.in_features * node.input_dtype.bits
+        out_bits = node.out_features * node.output_dtype.bits
+        lines = []
+        if self.clocked:
+            lines += ["        clk     : in  std_logic;", "        rst     : in  std_logic;"]
+        lines += [
+            "        valid_i : in  std_logic;",
+            f"        data_i  : in  std_logic_vector({in_bits - 1} downto 0);",
+            "        valid_o : out std_logic;",
+            f"        data_o  : out std_logic_vector({out_bits - 1} downto 0)",
+        ]
+        return "    port (\n" + "\n".join(lines) + "\n    );"
+
+    def component_declaration(self, node: IRNode, entity: str) -> str:
+        return f"    component {entity} is\n{self.ports(node)}\n    end component {entity};"
+
+    def instantiation(self, node: IRNode, entity: str, data_in: str, valid_in: str,
+                      data_out: str, valid_out: str) -> str:
+        maps = []
+        if self.clocked:
+            maps += ["            clk     => clk", "            rst     => rst"]
+        maps += [
+            f"            valid_i => {valid_in}",
+            f"            data_i  => {data_in}",
+            f"            valid_o => {valid_out}",
+            f"            data_o  => {data_out}",
+        ]
+        return f"    {entity}_inst : {entity}\n        port map (\n" + ",\n".join(maps) + "\n        );"
+
+    def entity(self, node: IRNode, entity: str) -> str:
+        return f"entity {entity} is\n{self.ports(node)}\nend entity {entity};\n\n"
 
     @staticmethod
-    def _vhdl_header() -> str:
+    def header(node: IRNode, entity: str) -> str:
+        src = node.attrs.get("onnx_node")
         return (
+            f"-- {entity}: {node.op_type} "
+            f"{node.in_features} x {node.input_dtype} -> {node.out_features} x {node.output_dtype}\n"
+            + (f"-- QONNX node: {src}\n" if src else "")
+            + "-- Generated by digitalify\n\n"
             "library ieee;\n"
             "use ieee.std_logic_1164.all;\n"
             "use ieee.numeric_std.all;\n\n"
         )
+
+    @staticmethod
+    def element(bus: str, idx: str, bits: int) -> str:
+        """VHDL slice of element *idx* of *bus*."""
+        return f"{bus}(({idx} + 1) * {bits} - 1 downto {idx} * {bits})"
+
+    @staticmethod
+    def aggregate(items: list[str], indent: str = "        ") -> str:
+        """Positional array aggregate; named for one element (VHDL requires it)."""
+        if len(items) == 1:
+            return f"(0 => {items[0]})"
+        return "(\n" + ",\n".join(indent + it for it in items) + "\n" + indent[:-4] + ")"
+
+    @staticmethod
+    def bit_literal(value: int, bits: int) -> str:
+        """Two's-complement bit-string literal, valid for any width."""
+        value = int(value)
+        if not -(1 << (bits - 1)) <= value < (1 << bits):
+            raise ValueError(f"{value} does not fit in {bits} bits")
+        return '"' + format(value & ((1 << bits) - 1), f"0{bits}b") + '"'

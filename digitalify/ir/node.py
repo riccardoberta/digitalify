@@ -1,13 +1,17 @@
 """
 Intermediate representation node.
 
-Every layer / operation in the model becomes one IRNode.  The VHDL backend
-consumes IRNodes; the torch.fx frontend produces them.
+Every hardware stage of the network becomes one IRNode.  The QONNX frontend
+produces them; the VHDL backend and the reference model consume them.
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass, field
+from math import prod
 from typing import Any
+
+from digitalify.ir.types import IntType
 
 
 @dataclass
@@ -20,30 +24,34 @@ class IRNode:
     name : str
         Unique name within the graph (e.g. ``"linear_0"``).
     op_type : str
-        Operator class string used to look up the handler in the registry.
-        Examples: ``"linear"``, ``"relu"``, ``"quantized_linear"``.
+        Operator class string used to look up the handler in the registry
+        (``"linear"`` or ``"relu"``).
     input_names : list[str]
-        Names of predecessor nodes whose outputs feed this node.
-        Use ``["__input__"]`` for the first node.
-    input_shape : tuple[int, ...]
-        Shape of the activation tensor arriving at this node
-        (batch dimension excluded, e.g. ``(784,)``).
-    output_shape : tuple[int, ...]
-        Shape of the activation tensor leaving this node.
+        Names of the predecessor nodes; ``["__input__"]`` for the network input.
+    input_shape, output_shape : tuple[int, ...]
+        Activation shapes, batch dimension excluded.
+    input_dtype, output_dtype : IntType
+        Integer type of one element of the input / output bus.
     attrs : dict[str, Any]
-        Operator-specific attributes.  Common keys:
+        Operator-specific attributes.
 
-        For ``linear`` / ``quantized_linear``:
-          - ``weight``  : numpy array, shape ``(out_features, in_features)``
-          - ``bias``    : numpy array, shape ``(out_features,)`` or ``None``
-          - ``scale``   : float — requantisation scale (output_scale /
-                          (input_scale * weight_scale)), default 1.0
-          - ``shift``   : int   — right-shift equivalent of *scale* when
-                          scale ≈ 1/2^shift, default 0
-          - ``in_zero`` : int   — input zero-point (for unsigned INT8), default 0
-          - ``out_zero``: int   — output zero-point, default 0
+        ``linear``:
+          - ``weight``  : int64 array ``(out_features, in_features)``
+          - ``bias``    : int64 array ``(out_features,)`` (zeros if absent),
+                          in units of ``s_in * s_w / 2**bias_frac_bits``
+          - ``bias_frac_bits`` : int F; ``acc = (Σ w·x) · 2**F + bias``
+          - ``bias_exact`` : bool — bias represented without rounding
+          - ``weight_dtype`` : IntType of the weight constants
+          - ``sum_dtype``    : IntType of the MAC chain Σ w·x
+          - ``acc_dtype``    : IntType of ``sum·2**F + bias`` (cannot overflow)
+          - ``relu``    : bool — apply max(0, ·) to the accumulator
+          - ``requant`` : dict or None.  When present:
+              ``multiplier`` (int array, per output channel),
+              ``shift`` (int array), ``rounding`` (str),
+              ``clip_min`` / ``clip_max`` (int), ``exact`` (bool).
+            When None the accumulator itself is the output.
 
-        For ``relu``: no extra keys needed.
+        ``relu``: no attributes.
     """
 
     name: str
@@ -51,24 +59,23 @@ class IRNode:
     input_names: list[str] = field(default_factory=list)
     input_shape: tuple[int, ...] = field(default_factory=tuple)
     output_shape: tuple[int, ...] = field(default_factory=tuple)
+    input_dtype: IntType | None = None
+    output_dtype: IntType | None = None
     attrs: dict[str, Any] = field(default_factory=dict)
-
-    # ------------------------------------------------------------------
-    # Convenience helpers
-    # ------------------------------------------------------------------
 
     @property
     def in_features(self) -> int:
-        """Flat number of input features (last dimension)."""
-        return int(self.input_shape[-1])
+        """Number of elements on the input bus."""
+        return int(prod(self.input_shape))
 
     @property
     def out_features(self) -> int:
-        """Flat number of output features (last dimension)."""
-        return int(self.output_shape[-1])
+        """Number of elements on the output bus."""
+        return int(prod(self.output_shape))
 
     def __repr__(self) -> str:
         return (
             f"IRNode(name={self.name!r}, op_type={self.op_type!r}, "
-            f"input_shape={self.input_shape}, output_shape={self.output_shape})"
+            f"{self.input_shape}:{self.input_dtype} -> "
+            f"{self.output_shape}:{self.output_dtype})"
         )

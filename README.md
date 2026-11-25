@@ -1,182 +1,190 @@
 # Digitalify
 
-Convert quantized PyTorch models into fully synthesisable VHDL descriptions.
+Convert quantized neural networks in **QONNX** format into fully synthesisable, **bit-exact** VHDL.
 
-Digitalify takes a neural network (expressed as a torch.fx operator-level graph after quantization) and generates structural VHDL that can be fed directly into any standard FPGA or ASIC synthesis flow (Vivado, Quartus, ...)).
+Digitalify reads a QONNX model — exported from Brevitas (`export_qonnx`), converted from QKeras, or built by hand — and generates structural VHDL-2008 that can go straight into any FPGA or ASIC synthesis flow (Vivado, Quartus, ...). It does not depend on PyTorch or any other training framework.
 
 ## How it works
 
-The library is organized as a classic compiler pipeline:
+The library is a classic compiler pipeline:
 
 ```
-PyTorch model
+QONNX model (.onnx with Quant nodes)
       │
-      ▼  torch.fx.symbolic_trace
-torch.fx GraphModule  (operator-level graph)
+      ▼  digitalify.from_qonnx      qonnx cleanup + pattern matching
+IRGraph  (integer IR: per-tensor bit widths, integer weights, requant constants)
       │
-      ▼  digitalify.frontend.from_fx_graph
-IRGraph  (technology-independent IR)
+      ├─▶ digitalify.VHDLGenerator  one component per layer + structural top level
+      ├─▶ testing.reference         bit-exact integer model of the hardware
       │
-      ▼  digitalify.backend.VHDLGenerator
-VHDL files  (one component per layer + one top-level structural entity)
+      ├─▶ digitalify.verify         integer model  ≡  QONNX execution (qonnx.core.onnx_exec)
+      └─▶ digitalify.simulate       VHDL           ≡  integer model    (GHDL testbench)
 ```
 
-Weights and biases are embedded as VHDL `constant` arrays, so the synthesiser sees them as ROM/LUT constants without any external memory interface. Activations flow through the design as `std_logic_vector` buses; a `valid` handshake signal propagates through the chain to mark when data is present.
+`verify` and `simulate` together close the loop: the generated hardware computes exactly what the QONNX model computes.
 
-## Supported operators
+### Integer semantics
 
-| Operator | op_type | VHDL behaviour |
+For a layer with per-tensor input scale `s_x`, per-output-channel weight scale `s_w[j]` and output `Quant` scale `s_y[j]`:
+
+```
+acc[j] = Σ_i q_w[j,i] · q_x[i] · 2^F  +  bias[j]              (bias in units of s_x·s_w/2^F)
+q_y[j] = clip( round( acc[j] · MULT[j] / 2^SHIFT[j] ) )        MULT/2^SHIFT = s_x·s_w[j]/s_y[j]
+```
+
+* Every float32 scale is a dyadic rational, so with power-of-two scales (the usual choice in Brevitas, QKeras, hls4ml) `MULT / 2^SHIFT` is **exact**. Arbitrary scales use a 32-bit fixed-point multiplier (`max_mult_bits`).
+* Float (unquantised) biases — Brevitas' default — get `F` fractional accumulator bits (`max_bias_frac_bits`, default 16) instead of being rounded away.
+* All seven QONNX rounding modes are implemented in hardware: `ROUND` (half-even), `HALF_UP`, `HALF_DOWN`, `FLOOR`, `CEIL`, `UP`, `DOWN`.
+* Accumulator widths come from interval analysis of the actual weights and input range, so they never overflow and are no wider than needed.
+
+## Supported patterns
+
+| QONNX pattern | IR op | Hardware |
 |---|---|---|
-| `nn.Linear` | `linear` | Combinational INT8 MAC array, 32-bit accumulator, registered output with saturation |
-| `nn.quantized.Linear` | `quantized_linear` | Same as above; quantization scale/shift baked in |
-| `nn.ReLU`, `nn.ReLU6`, `F.relu` | `relu` | Fully combinational comparator, zero latency |
+| `Quant` on the graph input (or an input with an integer QONNX DataType) | — | Sets the input bus type and scale |
+| `MatMul` / `Gemm` with `Quant(W)` weights `[→ Add(bias)] [→ Relu] [→ Quant]` | `linear` | Combinational MAC, registered output with ReLU + requantisation (1 clock) |
+| `Relu` on a quantised tensor | `relu` | Combinational, 0 clocks |
+| `Flatten`, `Reshape`, `Identity`, `Squeeze`, `Unsqueeze` | — | Free (the bus is already flat) |
 
-Any layer not in this table raises `UnsupportedOperatorError` immediately, so you always know exactly what is missing before attempting synthesis.
+Weights can have any bit width and per-tensor or per-channel scales; each activation tensor has its own width and signedness (e.g. INT8 input → UINT4 hidden → INT8 output). If no `Quant` follows a layer, its accumulator is the output.
+
+Anything else raises `UnsupportedOperatorError` (unknown op, branching graph, re-quantising an already quantised tensor, bipolar 1-bit quantisation) or `QONNXImportError` (unquantised input or weights, non-zero zero-point) at import time, before any VHDL is written. Convolutions and skip connections are the next operators on the roadmap.
 
 ## Installation
 
 ```bash
-pip install -e .
+pip install -e .            # numpy, onnx, qonnx
+pip install -e ".[dev]"     # + pytest, jupyter
 ```
 
-Requires Python ≥ 3.10, PyTorch ≥ 2.0, NumPy ≥ 1.24.
+Requires Python ≥ 3.10. Simulation additionally needs [GHDL](https://github.com/ghdl/ghdl/releases) ≥ 3.0, either on `PATH` or pointed to by the `DIGITALIFY_GHDL` environment variable.
 
 ## Quick start
 
 ```python
-import torch
-import torch.nn as nn
-import torch.fx as fx
 import digitalify
 
-# 1 — define and quantize a model
-model = nn.Sequential(nn.Linear(16, 8), nn.ReLU(), nn.Linear(8, 4))
-model.eval()
+# 1 — a QONNX model, e.g. from Brevitas:
+#       from brevitas.export import export_qonnx
+#       export_qonnx(brevitas_model, torch.randn(1, 16), "model.onnx")
+model = "model.onnx"
 
-quantized = torch.quantization.quantize_dynamic(
-    model, {nn.Linear}, dtype=torch.qint8
-)
-
-# 2 — trace to operator-level graph
-gm = fx.symbolic_trace(quantized)
+# 2 — inspect what will be built
+ir = digitalify.from_qonnx(model)
+print(ir.summary())
 
 # 3 — generate VHDL
-files = digitalify.convert(gm, input_shape=(16,), output_dir="vhdl_out/")
+files = digitalify.convert(model, output_dir="vhdl_out/")
 
-for name in files:
-    print(name)
-# linear_0.vhd
-# relu_0.vhd
-# linear_1.vhd
-# network_top.vhd
+# 4 — check the integer hardware model against QONNX execution
+print(digitalify.verify(model).summary())
+# [PASSED]  64/64 vectors match QONNX, max error 0 LSB
+
+# 5 — simulate the generated VHDL with GHDL
+print(digitalify.simulate(model).summary())
+# [PASSED]  16 passed, 0 failed
 ```
 
-See `examples/simple_network.ipynb` for a full walkthrough including model definition, quantization, tracing, VHDL generation, and error handling.
+No model at hand? `digitalify.testing.make_mlp` builds QONNX MLPs (any widths, scales, rounding modes) with plain `onnx.helper`:
+
+```python
+from digitalify.testing import make_mlp
+model = make_mlp([16, 8, 4], weight_bits=4, act_bits=6, output_bits=8)
+```
+
+See `examples/simple_network.ipynb` for a full walkthrough.
 
 ## Generated VHDL structure
 
-Each layer produces a self-contained entity + architecture file. A top-level structural entity wires them together:
+Each layer becomes a self-contained entity; a structural top level wires them together. Entity names are prefixed with the network name, so several networks can share a VHDL library:
 
 ```
 vhdl_out/
-├── linear_0.vhd       # first Linear layer (entity + architecture, weights embedded)
-├── relu_0.vhd         # ReLU activation
-├── linear_1.vhd       # second Linear layer
-└── network_top.vhd    # structural top-level, connects all components in order
+├── mlp_linear_0.vhd   # MatMul + bias + ReLU + requant, weights as constants
+├── mlp_linear_1.vhd
+└── mlp_top.vhd        # clk, rst, valid_i, data_i -> valid_o, data_o
 ```
 
-The linear component architecture looks like this at a high level:
+Bus packing: element `i` of a bus with `B`-bit elements is `data((i+1)*B-1 downto i*B)`. A `valid` bit travels with the data; latency is 1 clock per `linear` layer.
+
+The linear component, in outline:
 
 ```vhdl
--- Combinational MAC (weights are VHDL constants)
-for j in 0 to OUT_FEATURES-1 loop
-    temp_acc := BIASES(j);
-    for i in 0 to IN_FEATURES-1 loop
-        x        := signed(data_i((i+1)*8-1 downto i*8));
-        temp_acc := temp_acc + resize(x * WEIGHTS(j, i), 32);
+-- Combinational MAC at the exact width the weights need
+for j in 0 to OUT_F - 1 loop
+    s := (others => '0');
+    for i in 0 to IN_F - 1 loop
+        s := s + resize(x(i) * WEIGHTS(j)(i), SUM_W);
     end loop;
-    acc(j) <= temp_acc;
+    acc(j) <= shift_left(resize(s, ACC_W), F) + BIASES(j);
 end loop;
 
--- Registered output: right-shift requantisation + saturation clipping
-if rising_edge(clk) then
-    shifted := shift_right(acc(j), SHIFT);
-    -- clamp to [-128, 127] ...
-end if;
+-- Output register: ReLU, then q = clip(round(acc * MULT / 2^SHIFT))
+p := resize(a * MULT(j), P_W);
+q := shift_right(p, SHIFT(j));            -- floor
+r := p and SHIFT_MASK(j);                 -- discarded bits drive the rounding
+if r > half or (r = half and q(0) = '1') then q := q + 1; end if;   -- ROUND
 ```
 
-Latency is 1 clock cycle per linear layer (ReLU is zero-cycle, fully combinational).
+## Testing
+
+```bash
+pytest tests          # GHDL tests are skipped if GHDL is not found
+```
+
+The suite checks the rounding arithmetic, the importer's error handling and, for a matrix of models (mixed precision, odd widths, unsigned input, float bias, Gemm, per-channel and non-power-of-two scales, every rounding mode, ...), both `verify` (reference vs QONNX) and `simulate` (VHDL vs reference).
 
 ## Extending the library
 
-Adding a new operator requires three steps:
+Adding an operator takes four steps:
 
-**1.** Subclass `VHDLOperator` in `digitalify/operators/`:
-
-```python
-from digitalify.operators.base import VHDLOperator
-from digitalify.ir.node import IRNode
-
-class Conv2dOperator(VHDLOperator):
-    def component_declaration(self, node: IRNode) -> str: ...
-    def component_architecture(self, node: IRNode) -> str: ...
-    def instantiation(self, node, sig_in, sig_out, sig_vi, sig_vo) -> str: ...
-```
-
-**2.** Register it in `digitalify/operators/registry.py`:
-
-```python
-from digitalify.operators.conv import Conv2dOperator
-OPERATOR_REGISTRY["conv2d"] = Conv2dOperator
-```
-
-**3.** Add recognition logic in `digitalify/frontend/torch_importer.py` so that `nn.Conv2d` nodes are mapped to `op_type="conv2d"` and their weight tensor is stored in `IRNode.attrs`.
+1. **Frontend** — map the QONNX pattern to an `IRNode` in `digitalify/frontend/qonnx_importer.py`.
+2. **Hardware** — subclass `VHDLOperator` (`digitalify/operators/`) and implement `architecture(node, entity)`; set `latency` and `clocked`.
+3. **Register** it in `digitalify/operators/registry.py`.
+4. **Reference** — add its bit-exact model to `digitalify/testing/reference.py`, then a variant to `tests/test_end_to_end.py`.
 
 ## Design decisions
 
-**Why torch.fx and not ONNX?**
-Reading directly from the `torch.fx` graph preserves all quantization metadata (per-layer scale and zero-point) without protobuf parsing or opset-version uncertainty. It also gives direct access to live Python module objects, making weight extraction straightforward. ONNX support is planned as a second frontend — the `IRGraph` intermediate representation is the natural seam for plugging it in, since the VHDL backend would not need any changes.
+**Why QONNX?**
+QONNX is framework-neutral: Brevitas, QKeras (via `qonnx.converters`) and hls4ml/FINN all speak it, and its `Quant` node carries everything the hardware needs — scale, bit width, signedness, narrow range and rounding mode — for every tensor. The `qonnx` package also provides the cleanup passes and a reference executor, which `verify` uses as the golden model.
 
-**Why INT8 fixed-point?**
-INT8 is the dominant quantization format for on-device inference and maps cleanly to FPGA DSP slices. The accumulator is kept at 32 bits to avoid overflow for typical layer sizes (up to ~16 M input elements). The requantization step (right-shift + saturate) is a standard technique that synthesises efficiently on both FPGAs and ASICs.
+**Why bit-exact integer arithmetic?**
+The hardware should not just approximate the trained model: with power-of-two scales it reproduces the QONNX model's outputs exactly, which makes regressions trivially detectable.
 
-**Why hardcoded weight constants?**
-Embedding weights as VHDL `constant` arrays means the design is fully self-contained: no external memory bus, no DMA, no boot sequence. The synthesiser infers them as distributed LUTs or block-RAM depending on size, giving predictable timing. For very large models, a future option could target external memory interfaces instead.
+**Why hard-coded weight constants?**
+The design is self-contained: no external memory, DMA or boot sequence, and the synthesiser can constant-fold multiplications by small weights into LUTs. The fully parallel MAC trades area for latency; it suits small networks, and larger ones will need a folded/pipelined architecture.
 
 ## Project structure
 
 ```
 digitalify/
-├── __init__.py               # top-level convert() entry point
-├── exceptions.py             # UnsupportedOperatorError, VHDLGenerationError
+├── __init__.py               # convert(), simulate(), verify()
+├── exceptions.py             # UnsupportedOperatorError, QONNXImportError, VHDLGenerationError
+├── quant.py                  # rounding modes, fixed-point requant multipliers
+├── verify.py                 # integer model vs QONNX execution
 ├── ir/
-│   ├── node.py               # IRNode dataclass
-│   └── graph.py              # IRGraph (ordered node list + shapes)
+│   ├── types.py              # IntType (bits, signedness)
+│   ├── node.py               # IRNode
+│   └── graph.py              # IRGraph (nodes, bus types, scales)
 ├── frontend/
-│   └── torch_importer.py     # torch.fx GraphModule → IRGraph
+│   └── qonnx_importer.py     # QONNX model → IRGraph
 ├── operators/
 │   ├── base.py               # abstract VHDLOperator
-│   ├── registry.py           # op_type → handler class mapping
+│   ├── registry.py           # op_type → handler class
 │   ├── linear.py             # LinearOperator
 │   └── activations.py        # ReLUOperator
-└── backend/
-    └── vhdl/
-        └── generator.py      # IRGraph → dict[filename, VHDL source]
+├── backend/vhdl/
+│   ├── generator.py          # IRGraph → {filename: VHDL}
+│   └── naming.py             # VHDL identifier sanitising
+└── testing/
+    ├── qonnx_builder.py      # make_mlp(): QONNX models without PyTorch
+    ├── reference.py          # bit-exact integer model + test vectors
+    ├── tb_generator.py       # self-checking VHDL testbench
+    └── ghdl_runner.py        # GHDL analyse / elaborate / run
 
-vivado_api/
-├── main.py                   # FastAPI application and all routes
-├── config.py                 # settings (env vars) and board catalog
-├── models.py                 # Pydantic request / response schemas
-├── job_store.py              # file-based job persistence
-├── vivado/
-│   ├── runner.py             # TCL generation + Vivado subprocess wrapper
-│   └── parsers.py            # Vivado report text → structured data
-├── requirements.txt
-└── .env.example              # environment variable template
-
-examples/
-└── simple_network.ipynb      # end-to-end walkthrough notebook
-
+tests/                        # pytest suite
+examples/simple_network.ipynb # end-to-end walkthrough
+vivado_api/                   # REST service for remote Vivado synthesis (below)
 setup.py
 ```
 
@@ -203,8 +211,8 @@ All settings are read from environment variables (or a `.env` file):
 
 | Variable | Default | Description |
 |---|---|---|
-| `VIVADO_API_VIVADO_PATH` | `/tools/Xilinx/Vivado/2024.1/bin/vivado` | Path to the Vivado binary |
-| `VIVADO_API_WORKSPACE_DIR` | `/tmp/vivado_api` | Root directory for uploads and job artefacts |
+| `VIVADO_API_VIVADO_PATH` | `C:/Xilinx/2025.1/Vivado/bin/vivado.bat` (Windows), `/tools/Xilinx/2025.1/Vivado/bin/vivado` (Linux) | Path to the Vivado binary |
+| `VIVADO_API_WORKSPACE_DIR` | `C:/vivado_api` (Windows), `/tmp/vivado_api` (Linux) | Root directory for uploads and job artefacts |
 | `VIVADO_API_API_KEY` | *(empty)* | Bearer token for auth; empty disables auth |
 | `VIVADO_API_SYNTHESIS_TIMEOUT` | `3600` | Max seconds for a synthesis run |
 | `VIVADO_API_SIMULATION_TIMEOUT` | `600` | Max seconds for a simulation run |
@@ -235,7 +243,7 @@ All settings are read from environment variables (or a `.env` file):
     GET  /jobs/{id}                    → poll until synthesized or failed
 
 5.  GET  /jobs/{id}/synthesis          → utilization, timing, power + log tail
-    GET  /jobs/{id}/schematic          → download schematic PDF
+    GET  /jobs/{id}/log?type=synthesis → full Vivado log
     GET  /jobs/{id}/reports            → full parsed reports + raw text
 
 6.  POST /upload  (testbench file)     → get testbench file_id
@@ -261,7 +269,7 @@ After synthesis completes, three structured reports are available:
 import digitalify, requests
 
 # Generate VHDL locally
-files = digitalify.convert(gm, input_shape=(16,))
+files = digitalify.convert("model.onnx")
 
 BASE = "http://my-server:8000"
 HDR  = {"Authorization": "Bearer my-secret-token"}
@@ -276,7 +284,7 @@ for fname, vhdl in files.items():
 # Create job and synthesize
 job = requests.post(f"{BASE}/jobs", headers=HDR, json={
     "board_id": "nexys4ddr",
-    "top_entity": "network_top",
+    "top_entity": f"{digitalify.from_qonnx('model.onnx').name}_top",
     "file_ids": file_ids,
 }).json()
 

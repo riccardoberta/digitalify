@@ -1,24 +1,20 @@
 """
-Python integer arithmetic reference model.
+Bit-exact integer reference model of the generated hardware.
 
-Replicates the exact fixed-point computation of the generated VHDL so that
-expected outputs for test vectors can be computed without running a simulator.
-
-The arithmetic mirrors the VHDL component by component:
-
-  linear / quantized_linear
-  ─────────────────────────
-  acc[j] = bias[j] + Σ_i (weight[j,i] * x[i])      -- 32-bit accumulator
-  out[j] = clamp(arithmetic_right_shift(acc[j], shift), -128, 127)
+  linear
+  ──────
+  acc[j] = bias[j] + Σ_i weight[j,i] · x[i]               (exact, int64)
+  acc[j] = max(acc[j], 0)                                  if relu
+  out[j] = clip(shift_round(acc[j] · m[j], n[j], R), lo, hi)   if requant
+  out[j] = acc[j]                                          otherwise
 
   relu
   ────
-  out[i] = max(0, x[i])                              -- element-wise
+  out[i] = max(0, x[i])
 
-Note on overflow: the VHDL accumulator is 32-bit signed.  Here we use 64-bit
-integers so that the Python model never wraps; for networks with more than
-~16 M INT8 inputs this could diverge from the VHDL, but that is beyond the
-scope of typical test layers.
+``generate_test_vectors`` produces stimulus for the VHDL testbench, and
+``digitalify.verify`` compares this model against the QONNX execution of the
+original model, closing the loop  QONNX ⇔ reference ⇔ VHDL.
 """
 
 from __future__ import annotations
@@ -27,144 +23,80 @@ import numpy as np
 
 from digitalify.ir.graph import IRGraph
 from digitalify.ir.node import IRNode
+from digitalify.quant import shift_round
 
 
-# ---------------------------------------------------------------------------
-# Per-operator reference functions
-# ---------------------------------------------------------------------------
+def _linear_ref(x: np.ndarray, node: IRNode) -> np.ndarray:
+    w = node.attrs["weight"]
+    acc = ((x @ w.T) << node.attrs.get("bias_frac_bits", 0)) + node.attrs["bias"]   # (n, out)
+    if node.attrs.get("relu"):
+        acc = np.maximum(acc, 0)
+    rq = node.attrs.get("requant")
+    if rq is None:
+        return acc
+    mode = rq["rounding"]
+    fn = np.frompyfunc(lambda a, m, n: shift_round(int(a) * int(m), int(n), mode), 3, 1)
+    q = fn(acc, rq["multiplier"][None, :], rq["shift"][None, :]).astype(np.int64)
+    return np.clip(q, rq["clip_min"], rq["clip_max"])
 
-def _linear_ref(x: np.ndarray, node: IRNode, data_width: int = 8) -> np.ndarray:
+
+def run_reference(ir: IRGraph, inputs: np.ndarray) -> np.ndarray:
     """
-    Reference for ``linear`` / ``quantized_linear``.
-
-    Matches the VHDL:
-      * combinational 64-bit MAC (64-bit avoids Python-side overflow)
-      * arithmetic right-shift by ``shift`` bits
-      * clamp to [-2^(data_width-1), 2^(data_width-1)-1]
-    """
-    weight: np.ndarray = node.attrs["weight"]   # (out_features, in_features) int8
-    bias:   np.ndarray | None = node.attrs.get("bias")
-    shift:  int = node.attrs.get("shift", 0)
-
-    # Promote to int64 before multiplication to avoid overflow
-    acc = weight.astype(np.int64) @ x.astype(np.int64)
-    if bias is not None:
-        acc = acc + bias.astype(np.int64)
-
-    # Arithmetic right-shift: matches VHDL shift_right() on signed
-    if shift > 0:
-        acc = np.right_shift(acc, shift)
-
-    # Saturate to data_width-bit signed range (matches VHDL clamp)
-    lo = -(1 << (data_width - 1))
-    hi =  (1 << (data_width - 1)) - 1
-    return np.clip(acc, lo, hi).astype(np.int8)
-
-
-def _relu_ref(x: np.ndarray) -> np.ndarray:
-    """Reference for ``relu``: element-wise max(0, x), fully combinational."""
-    return np.maximum(0, x).astype(np.int8)
-
-
-# ---------------------------------------------------------------------------
-# Graph-level runner
-# ---------------------------------------------------------------------------
-
-def run_reference(
-    ir: IRGraph,
-    inputs: np.ndarray,
-    data_width: int = 8,
-) -> np.ndarray:
-    """
-    Run the reference model on a batch of input vectors.
+    Run the integer reference model.
 
     Parameters
     ----------
     ir : IRGraph
-        The computation graph describing the network.
     inputs : np.ndarray
-        Shape ``(n_vectors, in_features)``, dtype ``int8``.
-    data_width : int
-        Bit-width of activations (default 8).
+        Integer inputs, shape ``(n_vectors, *ir.input_shape)`` or
+        ``(n_vectors, in_features)``.
 
     Returns
     -------
     np.ndarray
-        Shape ``(n_vectors, out_features)``, dtype ``int8``.
-
-    Raises
-    ------
-    ValueError
-        If the graph contains an operator without a reference implementation.
+        int64 outputs, shape ``(n_vectors, out_features)``.
     """
-    results = []
-    for x in inputs:
-        x = x.astype(np.int8)
-        for node in ir.nodes:
-            if node.op_type in ("linear", "quantized_linear"):
-                x = _linear_ref(x, node, data_width=data_width)
-            elif node.op_type == "relu":
-                x = _relu_ref(x)
-            else:
-                raise ValueError(
-                    f"No reference implementation for op_type '{node.op_type}'. "
-                    "Add one in digitalify/testing/reference.py."
-                )
-        results.append(x)
-    return np.array(results, dtype=np.int8)
+    x = np.asarray(inputs, dtype=np.int64).reshape(len(inputs), -1)
+    values = {"__input__": x}
+    for node in ir.nodes:
+        xin = values[node.input_names[0]]
+        if node.op_type == "linear":
+            y = _linear_ref(xin, node)
+        elif node.op_type == "relu":
+            y = np.maximum(xin, 0)
+        else:
+            raise ValueError(
+                f"No reference implementation for op_type '{node.op_type}'. "
+                "Add one in digitalify/testing/reference.py."
+            )
+        values[node.name] = y
+    return values[ir.nodes[-1].name]
 
-
-# ---------------------------------------------------------------------------
-# Test vector factory
-# ---------------------------------------------------------------------------
 
 def generate_test_vectors(
     ir: IRGraph,
     n_vectors: int = 8,
-    data_width: int = 8,
     seed: int = 42,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Generate random INT8 input vectors and their expected outputs.
+    Integer input vectors and the reference outputs.
 
-    The first three vectors are always edge-case inputs:
-      - all zeros
-      - all max (2^(data_width-1) - 1 = 127 for INT8)
-      - all min (-128 for INT8)
-    The remainder are random.
-
-    Parameters
-    ----------
-    ir : IRGraph
-        Used to determine ``input_shape`` and to run the reference model.
-    n_vectors : int
-        Total number of test vectors (at least 3 recommended).
-    data_width : int
-        Activation bit-width.
-    seed : int
-        NumPy RNG seed for reproducibility.
+    The first vectors are edge cases (all zeros, all max, all min); the rest
+    are uniformly random over the input range.
 
     Returns
     -------
-    (inputs, outputs) : tuple[np.ndarray, np.ndarray]
-        Both have shape ``(n_vectors, features)`` and dtype ``int8``.
+    (inputs, outputs) : int64 arrays of shape ``(n, in_features)`` and
+    ``(n, out_features)``.
     """
-    in_features = ir.input_shape[-1]
-    lo = -(1 << (data_width - 1))        # -128
-    hi =  (1 << (data_width - 1)) - 1   #  127
-
+    lo, hi = ir.input_range
+    n_in = ir.in_features
     rng = np.random.default_rng(seed)
-
-    # Edge cases
     edge = np.array([
-        np.zeros(in_features, dtype=np.int8),               # all zeros
-        np.full(in_features, hi,  dtype=np.int8),           # all max
-        np.full(in_features, lo,  dtype=np.int8),           # all min
-    ])
-
-    n_random = max(0, n_vectors - len(edge))
-    random_vecs = rng.integers(lo, hi + 1, size=(n_random, in_features), dtype=np.int8)
-
-    inputs = np.concatenate([edge[:n_vectors], random_vecs], axis=0)[:n_vectors]
-    outputs = run_reference(ir, inputs, data_width=data_width)
-    return inputs, outputs
+        np.full(n_in, min(max(0, lo), hi)),
+        np.full(n_in, hi),
+        np.full(n_in, lo),
+    ], dtype=np.int64)
+    rand = rng.integers(lo, hi + 1, size=(max(0, n_vectors - len(edge)), n_in), dtype=np.int64)
+    inputs = np.concatenate([edge, rand])[:n_vectors]
+    return inputs, run_reference(ir, inputs)

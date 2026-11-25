@@ -1,3 +1,3 @@
-from digitalify.frontend.torch_importer import from_fx_graph
+from digitalify.frontend.qonnx_importer import from_qonnx, load_qonnx
 
-__all__ = ["from_fx_graph"]
+__all__ = ["from_qonnx", "load_qonnx"]
