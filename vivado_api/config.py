@@ -8,6 +8,9 @@ Example .env file (Windows):
     VIVADO_API_WORKSPACE_DIR=C:/vivado_api
     VIVADO_API_API_KEY=mysecrettoken
 
+An API key is mandatory: with an empty VIVADO_API_API_KEY the server refuses
+to start unless VIVADO_API_ALLOW_NO_AUTH=true is set explicitly.
+
 Note: use forward slashes in paths even on Windows — both Python's pathlib
 and Vivado's TCL interpreter handle them correctly on all platforms.
 """
@@ -46,11 +49,18 @@ class Settings(BaseSettings):
         description="Root workspace directory for uploads and job artefacts",
     )
 
-    # Optional Bearer token for API authentication.
-    # Leave empty ("") to disable authentication entirely.
+    # Bearer token for API authentication.
+    # The server refuses to start without one unless allow_no_auth is set.
     api_key: str = Field(
         default="",
-        description="Bearer token for API auth; empty string disables auth",
+        description="Bearer token for API auth (required unless allow_no_auth=true)",
+    )
+
+    # Explicit opt-out: run without authentication (local development only —
+    # anyone who can reach the port can then run Vivado on this machine).
+    allow_no_auth: bool = Field(
+        default=False,
+        description="Allow starting with an empty api_key (disables auth)",
     )
 
     # Maximum wall-clock seconds allowed for a single synthesis run

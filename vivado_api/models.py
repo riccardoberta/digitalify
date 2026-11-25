@@ -4,9 +4,44 @@ Pydantic request / response schemas for the Vivado API.
 
 from __future__ import annotations
 from enum import Enum
-from typing import Any
-from pydantic import BaseModel, Field
+from typing import Annotated, Literal
+from pydantic import BaseModel, Field, StringConstraints
 from datetime import datetime
+
+
+# ---------------------------------------------------------------------------
+# Validated string types
+# ---------------------------------------------------------------------------
+# Every value below ends up interpolated into a generated TCL script, so it
+# must be restricted to a safe character set: anything else (brackets, $,
+# quotes, braces, whitespace, newlines) would allow TCL command injection.
+
+#: Canonical hyphenated lowercase UUID, as produced by str(uuid.uuid4()).
+UUID_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+
+#: Basic VHDL identifier (extended/escaped identifiers are not allowed).
+VHDL_IDENTIFIER_PATTERN = r"^[A-Za-z][A-Za-z0-9_]*$"
+
+#: Simulation time: a number immediately followed by a VHDL time unit.
+RUNTIME_PATTERN = r"^\d+(\.\d+)?(fs|ps|ns|us|ms|s)$"
+
+UUIDStr = Annotated[str, StringConstraints(pattern=UUID_PATTERN)]
+VHDLIdentifier = Annotated[
+    str, StringConstraints(pattern=VHDL_IDENTIFIER_PATTERN, max_length=128)
+]
+RuntimeStr = Annotated[str, StringConstraints(pattern=RUNTIME_PATTERN, max_length=32)]
+
+SynthStrategy = Literal[
+    "default",
+    "RuntimeOptimized",
+    "AreaOptimized_high",
+    "AreaOptimized_medium",
+    "AlternateRoutability",
+    "AreaMapLargeShiftRegToBRAM",
+    "FewerCarryChains",
+]
+
+FlattenHierarchy = Literal["rebuilt", "full", "none"]
 
 
 # ---------------------------------------------------------------------------
@@ -58,8 +93,10 @@ class UploadResponse(BaseModel):
 
 class CreateJobRequest(BaseModel):
     board_id:    str   = Field(..., description="Board ID from GET /boards")
-    top_entity:  str   = Field(..., description="Name of the VHDL top-level entity")
-    file_ids:    list[str] = Field(..., description="File IDs returned by POST /upload")
+    top_entity:  VHDLIdentifier = Field(..., description="Name of the VHDL top-level entity")
+    file_ids:    list[UUIDStr] = Field(
+        ..., min_length=1, description="File IDs returned by POST /upload"
+    )
 
 
 class JobResponse(BaseModel):
@@ -78,7 +115,7 @@ class JobResponse(BaseModel):
 
 class SynthesisRequest(BaseModel):
     """Optionally override synthesis options at trigger time."""
-    strategy: str = Field(
+    strategy: SynthStrategy = Field(
         default="default",
         description=(
             "Vivado synth_design -directive value. "
@@ -87,7 +124,7 @@ class SynthesisRequest(BaseModel):
             "AreaMapLargeShiftRegToBRAM, FewerCarryChains."
         ),
     )
-    flatten_hierarchy: str = Field(
+    flatten_hierarchy: FlattenHierarchy = Field(
         default="rebuilt",
         description="flatten_hierarchy setting: rebuilt, full, or none.",
     )
@@ -137,10 +174,12 @@ class SynthesisResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 class SimulationRequest(BaseModel):
-    testbench_file_id: str  = Field(..., description="File ID of the VHDL testbench")
-    testbench_top:     str  = Field(..., description="Name of the testbench entity")
-    runtime:           str  = Field(default="1000ns",
-                                    description="Simulation run time (e.g. '1000ns', '1us')")
+    testbench_file_id: UUIDStr = Field(..., description="File ID of the VHDL testbench")
+    testbench_top:     VHDLIdentifier = Field(..., description="Name of the testbench entity")
+    runtime:           RuntimeStr = Field(
+        default="1000ns",
+        description="Simulation run time, no spaces (e.g. '1000ns', '1.5us')",
+    )
 
 
 class SimulationResult(BaseModel):
