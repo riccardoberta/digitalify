@@ -37,7 +37,7 @@ import re
 
 
 def _table_value(text: str, label: str, col: int = 1) -> str | None:
-    """
+    r"""
     Find a row in a Vivado ASCII table by *label* and return column *col*
     (0-indexed from after the first ``|``).
 
