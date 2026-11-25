@@ -107,18 +107,6 @@ report_utilization    -file "$work_dir/utilization.rpt"
 report_timing_summary -file "$work_dir/timing.rpt"     -quiet
 report_power          -file "$work_dir/power.rpt"       -quiet
 
-# ── Schematic (PDF) ──────────────────────────────────────────────────────────
-puts "INFO: Writing schematic ..."
-if {{ [catch {{
-    write_schematic -force -format pdf "$work_dir/schematic.pdf"
-}} err] }} {{
-    puts "WARNING: write_schematic failed: $err"
-    puts "INFO: Trying PNG fallback ..."
-    catch {{
-        write_schematic -force -format png "$work_dir/schematic.png"
-    }}
-}}
-
 # ── Checkpoint ───────────────────────────────────────────────────────────────
 write_checkpoint -force "$work_dir/synth.dcp"
 puts "INFO: All done."
@@ -148,14 +136,16 @@ set tb_top     {testbench_top}
 set sim_time   {runtime}
 
 # ── Project ──────────────────────────────────────────────────────────────────
-create_project -in_memory -part $part
+# launch_simulation requires a real on-disk project (not -in_memory).
+# We create it inside the job work directory; -force overwrites on re-runs.
+set proj_dir "$work_dir/sim_project"
+create_project sim_project $proj_dir -part $part -force
 
 # ── Design sources ────────────────────────────────────────────────────────────
 {read_design}
 
 # ── Testbench ────────────────────────────────────────────────────────────────
 read_vhdl -vhdl2008 "{tb_path}"
-
 
 # ── Simulation fileset ────────────────────────────────────────────────────────
 set_property top      $tb_top      [get_filesets sim_1]
@@ -168,13 +158,6 @@ launch_simulation -simset sim_1 -mode behavioral
 
 puts "INFO: Running for $sim_time ..."
 run $sim_time
-
-# ── Save waveform database ────────────────────────────────────────────────────
-if {{ [catch {{
-    write_wave_db "$work_dir/sim.wdb"
-}} err] }} {{
-    puts "WARNING: write_wave_db failed: $err"
-}}
 
 close_sim
 puts "INFO: Simulation complete."
@@ -233,7 +216,7 @@ def _run_vivado(tcl_script: str, log_file: Path, timeout: int) -> tuple[int, str
 
 def run_synthesis(
     job_id: str,
-    strategy: str = "Flow_PerfOptimized_high",
+    strategy: str = "default",
     flatten_hierarchy: str = "rebuilt",
 ) -> dict:
     """

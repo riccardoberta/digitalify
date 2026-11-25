@@ -25,7 +25,7 @@ from fastapi import (
     FastAPI, BackgroundTasks, Depends, File, Form, HTTPException,
     Security, UploadFile, status,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 import job_store
@@ -50,7 +50,7 @@ app = FastAPI(
     description=(
         "REST API for Xilinx Vivado synthesis and simulation. "
         "Upload VHDL sources, select a target board, trigger synthesis, "
-        "download the schematic, run simulations, and retrieve performance reports."
+        "run simulations, and retrieve performance reports."
     ),
     version="0.1.0",
 )
@@ -348,40 +348,46 @@ def get_synthesis_result(_: Auth, job_id: str) -> SynthesisResult:
 
 
 # ---------------------------------------------------------------------------
-# Routes — schematic
+# Routes — log
 # ---------------------------------------------------------------------------
 
-@app.get("/jobs/{job_id}/schematic", tags=["synthesis"])
-def get_schematic(_: Auth, job_id: str):
+@app.get(
+    "/jobs/{job_id}/log",
+    response_class=PlainTextResponse,
+    tags=["synthesis"],
+)
+def get_log(_: Auth, job_id: str, type: str = "synthesis") -> PlainTextResponse:
     """
-    Download the schematic generated during synthesis.
+    Return the full Vivado log file for this job as plain text.
 
-    Vivado exports it as PDF (preferred) or PNG depending on the
-    version installed.  Returns 404 if synthesis has not completed
-    or if schematic generation failed (check the log for details).
+    The ``type`` query parameter selects which log to retrieve:
+    - ``synthesis``  (default) — written during ``POST /jobs/{job_id}/synthesize``
+    - ``simulation`` — written during ``POST /jobs/{job_id}/simulate``
+
+    Unlike the ``log_tail`` field in the synthesis/simulation result endpoints,
+    this returns the complete file with no truncation.
     """
-    state = _require_job(job_id)
+    _require_job(job_id)
     work = job_store.job_dir(job_id)
 
-    for fname, media_type in [
-        ("schematic.pdf", "application/pdf"),
-        ("schematic.png", "image/png"),
-    ]:
-        path = work / fname
-        if path.exists():
-            return FileResponse(
-                path=str(path),
-                media_type=media_type,
-                filename=f"{job_id}_{fname}",
-            )
+    log_files = {
+        "synthesis":  work / "synthesis.log",
+        "simulation": work / "simulation.log",
+    }
+    if type not in log_files:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown log type '{type}'. Valid values: synthesis, simulation.",
+        )
 
-    raise HTTPException(
-        status_code=404,
-        detail=(
-            "Schematic not available. Ensure synthesis completed successfully "
-            "and that write_schematic is supported by your Vivado build."
-        ),
-    )
+    path = log_files[type]
+    if not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No {type} log found for job '{job_id}'. Has the {type} step run yet?",
+        )
+
+    return PlainTextResponse(path.read_text(errors="replace"))
 
 
 # ---------------------------------------------------------------------------

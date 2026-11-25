@@ -40,8 +40,12 @@ def _table_value(text: str, label: str, col: int = 1) -> str | None:
     """
     Find a row in a Vivado ASCII table by *label* and return column *col*
     (0-indexed from after the first ``|``).
+
+    ``\S*`` after the label allows an optional suffix such as the ``*``
+    that Vivado appends to "Slice LUTs*" in synthesis-only reports to
+    indicate the count is an estimate (pre-implementation).
     """
-    pattern = rf"\|\s*{re.escape(label)}\s*\|([^|]+)\|" + r"([^|]+)\|" * col
+    pattern = rf"\|\s*{re.escape(label)}\S*\s*\|([^|]+)\|" + r"([^|]+)\|" * col
     m = re.search(pattern, text, re.IGNORECASE)
     if not m:
         return None

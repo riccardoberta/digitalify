@@ -3,7 +3,7 @@ File-based job persistence.
 
 Every job lives in its own directory under ``{workspace_dir}/jobs/{job_id}/``.
 The mutable state is kept in ``state.json``; all Vivado artefacts (logs,
-reports, schematic) land in the same directory.
+reports) land in the same directory.
 
 Thread-safety: writes are serialised with a per-job threading.Lock so that
 concurrent API calls (e.g. a status poll racing with a background synthesis

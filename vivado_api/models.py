@@ -78,10 +78,19 @@ class JobResponse(BaseModel):
 
 class SynthesisRequest(BaseModel):
     """Optionally override synthesis options at trigger time."""
-    strategy:    str = Field(default="Flow_PerfOptimized_high",
-                             description="Vivado synthesis strategy")
-    flatten_hierarchy: str = Field(default="rebuilt",
-                                   description="flatten_hierarchy setting")
+    strategy: str = Field(
+        default="default",
+        description=(
+            "Vivado synth_design -directive value. "
+            "Valid options: default, RuntimeOptimized, AreaOptimized_high, "
+            "AreaOptimized_medium, AlternateRoutability, "
+            "AreaMapLargeShiftRegToBRAM, FewerCarryChains."
+        ),
+    )
+    flatten_hierarchy: str = Field(
+        default="rebuilt",
+        description="flatten_hierarchy setting: rebuilt, full, or none.",
+    )
 
 
 class UtilizationReport(BaseModel):

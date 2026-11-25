@@ -4,7 +4,7 @@ Server configuration.
 All values can be overridden via environment variables (prefix: VIVADO_API_).
 Example .env file (Windows):
 
-    VIVADO_API_VIVADO_PATH=C:/Xilinx/Vivado/2025.1/bin/vivado.bat
+    VIVADO_API_VIVADO_PATH=C:/Xilinx/2025.1/Vivado/bin/vivado.bat
     VIVADO_API_WORKSPACE_DIR=C:/vivado_api
     VIVADO_API_API_KEY=mysecrettoken
 
@@ -19,9 +19,9 @@ from pydantic import Field
 
 # Default Vivado executable path differs by platform
 _DEFAULT_VIVADO = (
-    r"C:/Xilinx/Vivado/2025.1/bin/vivado.bat"
+    r"C:/Xilinx/2025.1/Vivado/bin/vivado.bat"
     if sys.platform == "win32"
-    else "/tools/Xilinx/Vivado/2025.1/bin/vivado"
+    else "/tools/Xilinx/2025.1/Vivado/bin/vivado"
 )
 
 _DEFAULT_WORKSPACE = (
