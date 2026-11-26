@@ -92,52 +92,47 @@ def parse_utilization(report: str) -> dict:
 # ---------------------------------------------------------------------------
 # Timing summary report  (report_timing_summary)
 # ---------------------------------------------------------------------------
-# Key lines look like:
-#   WNS(ns)      TNS(ns)  TNS Failing Endpoints  TNS Total Endpoints
-#      1.234       0.000                      0                  123
+# The "Design Timing Summary" table puts setup, hold and pulse-width columns
+# on ONE header line (column names are separated by 2+ spaces):
 #
-#   WHS(ns)      THS(ns)  THS Failing Endpoints  THS Total Endpoints
-#      0.567       0.000                      0                  123
+#     WNS(ns)      TNS(ns)  TNS Failing Endpoints  ...      WHS(ns)      THS(ns)  ...
+#     -------      -------  ---------------------  ...      -------      -------  ...
+#      -1.234     -12.000                      8  ...        0.045        0.000  ...
 
-def _timing_row(text: str, header: str) -> list[str] | None:
-    """Return the data row immediately following the header row."""
-    idx = text.find(header)
-    if idx == -1:
-        return None
-    # Move to the start of the line *after* the header line
-    eol = text.find("\n", idx)
-    if eol == -1:
-        return None
-    rest = text[eol + 1:]
-    # Skip blank lines and pure-dash separator lines (e.g. "------")
-    # Note: data lines with negative values also start with '-', so we
-    # distinguish separators by checking that the line contains only '-' and spaces.
-    for line in rest.splitlines():
-        stripped = line.strip()
-        if not stripped:
+def _timing_summary(text: str) -> dict[str, str]:
+    """Map column name → value of the first table whose header has WNS(ns)."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if "WNS(ns)" not in line:
             continue
-        if all(c in "-+ " for c in stripped):
-            continue   # separator line
-        return stripped.split()
-    return None
+        names = re.split(r"\s{2,}", line.strip())
+        for data in lines[i + 1:]:
+            stripped = data.strip()
+            if not stripped:
+                continue
+            if all(c in "-+ " for c in stripped):
+                continue   # separator line (data with negative values also starts with '-')
+            values = stripped.split()
+            if len(values) != len(names):
+                return {}
+            return dict(zip(names, values))
+        return {}
+    return {}
 
 
 def parse_timing(report: str) -> dict:
-    setup_row = _timing_row(report, "WNS(ns)")
-    hold_row  = _timing_row(report, "WHS(ns)")
+    cols = _timing_summary(report)
 
-    def _f(row, idx):
-        if row is None or idx >= len(row):
-            return None
+    def _f(name):
         try:
-            return float(row[idx])
-        except ValueError:
+            return float(cols[name])
+        except (KeyError, ValueError):
             return None
 
-    wns = _f(setup_row, 0)
-    tns = _f(setup_row, 1)
-    whs = _f(hold_row,  0)
-    ths = _f(hold_row,  1)
+    wns = _f("WNS(ns)")
+    tns = _f("TNS(ns)")
+    whs = _f("WHS(ns)")
+    ths = _f("THS(ns)")
 
     timing_met: bool | None = None
     if wns is not None and tns is not None:

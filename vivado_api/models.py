@@ -128,6 +128,31 @@ class SynthesisRequest(BaseModel):
         default="rebuilt",
         description="flatten_hierarchy setting: rebuilt, full, or none.",
     )
+    clock_period_ns: float | None = Field(
+        default=None,
+        gt=0,
+        le=1000,
+        description=(
+            "Target clock period in ns.  When set, a clock is created on "
+            "`clock_port` and all other inputs/outputs get a 0 ns I/O delay "
+            "relative to it, so timing covers the input-to-register paths too "
+            "and power is estimated at this frequency.  Without it Vivado has "
+            "no timing constraints and the timing/power reports are not meaningful."
+        ),
+    )
+    clock_port: VHDLIdentifier = Field(
+        default="clk",
+        description="Top-level clock port the clock is created on.",
+    )
+    out_of_context: bool = Field(
+        default=False,
+        description=(
+            "Synthesise out of context (synth_design -mode out_of_context): no I/O "
+            "buffers are inserted.  Use it for IP cores such as digitalify networks "
+            "whose ports are not connected to board pins; utilization and power then "
+            "reflect the logic only."
+        ),
+    )
 
 
 class UtilizationReport(BaseModel):
@@ -149,6 +174,8 @@ class TimingReport(BaseModel):
     whs_ns:       float | None = None   # Worst Hold Slack
     ths_ns:       float | None = None   # Total Hold Slack
     timing_met:   bool  | None = None
+    clock_period_ns: float | None = None  # constraint used (None = unconstrained)
+    fmax_mhz:     float | None = None   # 1000 / (period - WNS), post-synthesis estimate
 
 
 class PowerReport(BaseModel):

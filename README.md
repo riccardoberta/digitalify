@@ -228,6 +228,7 @@ All settings are read from environment variables (or a `.env` file):
 | `zedboard` | Avnet ZedBoard | Zynq-7000 | 53 200 |
 | `kcu105` | Xilinx KCU105 | Kintex UltraScale | 242 400 |
 | `vcu118` | Xilinx VCU118 | Virtex UltraScale+ | 1 182 240 |
+| `kv260` | AMD Kria KV260 Vision AI Starter Kit | Zynq UltraScale+ | 117 120 |
 
 ### Typical workflow
 
@@ -240,6 +241,7 @@ All settings are read from environment variables (or a `.env` file):
                                        → get job_id  (status: pending)
 
 4.  POST /jobs/{id}/synthesize         → trigger Vivado  (status: synthesizing)
+         {clock_period_ns, clock_port, out_of_context, strategy, flatten_hierarchy}
     GET  /jobs/{id}                    → poll until synthesized or failed
 
 5.  GET  /jobs/{id}/synthesis          → utilization, timing, power + log tail
@@ -253,13 +255,27 @@ All settings are read from environment variables (or a `.env` file):
     GET  /jobs/{id}/simulation         → log tail and elapsed time
 ```
 
+### Synthesis options
+
+`POST /jobs/{id}/synthesize` accepts an optional JSON body:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `clock_period_ns` | *none* | Creates a clock on `clock_port` and a 0 ns input/output delay on every other port, so the full input → MAC → register path is timed. **Without it Vivado has no constraints and the timing / power reports are not meaningful.** |
+| `clock_port` | `clk` | Clock port of the top entity (digitalify uses `clk`). |
+| `out_of_context` | `false` | `synth_design -mode out_of_context`: no I/O buffers. Use it for digitalify networks, whose ports are not tied to board pins — otherwise every bus bit becomes an IOB and power is estimated for unconstrained pins. |
+| `strategy` | `default` | `synth_design -directive` value. |
+| `flatten_hierarchy` | `rebuilt` | `rebuilt`, `full` or `none`. |
+
+Constraint files (`.xdc`) uploaded with the sources are also read; use them instead of `clock_period_ns` for real board pin-outs.
+
 ### Reports returned
 
 After synthesis completes, three structured reports are available:
 
 **Utilization** — LUT, flip-flop, DSP, BRAM counts with percentage of device used.
 
-**Timing** — worst-case setup slack (WNS), total negative slack (TNS), hold slack (WHS), and a boolean `timing_met` field.
+**Timing** — worst-case setup slack (WNS), total negative slack (TNS), hold slack (WHS/THS), a boolean `timing_met` (setup), the `clock_period_ns` used and the implied `fmax_mhz` = 1000 / (period − WNS). These are post-synthesis estimates; hold is only meaningful after implementation.
 
 **Power** — total on-chip power, split into dynamic and static components, plus junction temperature and confidence level.
 
@@ -288,7 +304,8 @@ job = requests.post(f"{BASE}/jobs", headers=HDR, json={
     "file_ids": file_ids,
 }).json()
 
-requests.post(f"{BASE}/jobs/{job['job_id']}/synthesize", headers=HDR)
+requests.post(f"{BASE}/jobs/{job['job_id']}/synthesize", headers=HDR,
+              json={"clock_period_ns": 10, "out_of_context": True})
 
 # Poll until done, then fetch reports
 import time
@@ -300,7 +317,7 @@ while True:
 
 reports = requests.get(f"{BASE}/jobs/{job['job_id']}/reports", headers=HDR).json()
 print("LUTs used :", reports["utilization"]["luts"])
-print("Timing met:", reports["timing"]["timing_met"])
+print("Timing met:", reports["timing"]["timing_met"], " fmax:", reports["timing"]["fmax_mhz"], "MHz")
 print("Power (W) :", reports["power"]["total_power_w"])
 ```
 

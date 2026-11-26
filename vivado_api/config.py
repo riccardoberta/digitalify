@@ -122,4 +122,13 @@ BOARD_CATALOG: dict[str, dict] = {
         "family": "Virtex UltraScale+",
         "description": "Xilinx VCU118 — Virtex UltraScale+, 1 182 240 LUTs",
     },
+    "kv260": {
+        "name": "Kria KV260",
+        "part": "xck26-sfvc784-2LV-c",
+        "family": "Zynq UltraScale+",
+        "description": (
+            "AMD Kria KV260 Vision AI Starter Kit — K26 SOM (Zynq UltraScale+), "
+            "117 120 LUTs, 1 248 DSPs, quad ARM Cortex-A53, MIPI camera + HDMI/DP out"
+        ),
+    },
 }

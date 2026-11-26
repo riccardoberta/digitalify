@@ -178,6 +178,9 @@ async def _background_synthesize(job_id: str, opts: SynthesisRequest) -> None:
                 job_id,
                 strategy=opts.strategy,
                 flatten_hierarchy=opts.flatten_hierarchy,
+                clock_period_ns=opts.clock_period_ns,
+                clock_port=opts.clock_port,
+                out_of_context=opts.out_of_context,
             ),
         )
     except Exception as exc:
