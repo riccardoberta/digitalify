@@ -99,10 +99,11 @@ def verify(
     in_shape = mw.get_tensor_shape(in_name)
 
     golden = np.empty(reference.shape, dtype=np.float64)
-    for k, q in enumerate(inputs):
-        x = (q.astype(np.float64) * ir.input_scale).astype(np.float32).reshape(in_shape)
-        y = execute_onnx(mw, {in_name: x})[out_name]
-        golden[k] = np.asarray(y, dtype=np.float64).reshape(-1) / ir.output_scale
+    onnx_inputs = ir.stream_to_onnx(inputs, "input")
+    for k in range(len(inputs)):
+        x = (onnx_inputs[k].astype(np.float64) * ir.input_scale).astype(np.float32).reshape(in_shape)
+        y = np.asarray(execute_onnx(mw, {in_name: x})[out_name], dtype=np.float64)
+        golden[k] = ir.onnx_to_stream(y.reshape(1, *ir.output_shape), "output")[0] / ir.output_scale
 
     err = np.abs(golden - reference)
     # QONNX runs in float32: allow its rounding noise (a few ulp of the largest
@@ -111,11 +112,13 @@ def verify(
     float_noise = np.abs(golden).max(axis=0, keepdims=True) * 4e-6
     bad = err > tolerance_lsb + 1e-3 + float_noise
     linear = [n for n in ir.nodes if n.op_type == "linear"]
+    requants = [n.attrs["requant"] for n in linear if n.attrs["requant"] is not None]
+    requants += [n.attrs for n in ir.nodes if n.op_type == "requant"]
     return VerificationResult(
         n_vectors=len(inputs),
         n_mismatch=int(bad.any(axis=1).sum()),
         max_error_lsb=float(err.max()) if err.size else 0.0,
-        requant_exact=all(n.attrs["requant"] is None or n.attrs["requant"]["exact"] for n in linear),
+        requant_exact=all(rq["exact"] for rq in requants),
         bias_exact=all(n.attrs.get("bias_exact", True) for n in linear),
         inputs=inputs,
         reference=reference,

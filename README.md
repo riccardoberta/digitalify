@@ -1,8 +1,8 @@
 # Digitalify
 
-Convert quantized neural networks in **QONNX** format into fully synthesisable, **bit-exact** VHDL.
+Convert quantized neural networks in **QONNX** format into fully synthesisable, **bit-exact**, streaming VHDL.
 
-Digitalify reads a QONNX model — exported from Brevitas (`export_qonnx`), converted from QKeras, or built by hand — and generates structural VHDL-2008 that can go straight into any FPGA or ASIC synthesis flow (Vivado, Quartus, ...). It does not depend on PyTorch or any other training framework.
+Digitalify reads a QONNX model — exported from Brevitas (`export_qonnx`), converted from QKeras, or built by hand — and generates structural VHDL-2008 that can go straight into any FPGA or ASIC synthesis flow (Vivado, Quartus, ...). MLPs and convolutional networks (1-D and 2-D) are supported. It does not depend on PyTorch or any other training framework.
 
 ## How it works
 
@@ -11,10 +11,10 @@ The library is a classic compiler pipeline:
 ```
 QONNX model (.onnx with Quant nodes)
       │
-      ▼  digitalify.from_qonnx      qonnx cleanup + pattern matching
-IRGraph  (integer IR: per-tensor bit widths, integer weights, requant constants)
+      ▼  digitalify.from_qonnx      qonnx cleanup + lowering to streaming stages
+IRGraph  (integer IR: stream shapes, bit widths, integer weights, requant constants)
       │
-      ├─▶ digitalify.VHDLGenerator  one component per layer + structural top level
+      ├─▶ digitalify.VHDLGenerator  one component per stage + structural top level
       ├─▶ testing.reference         bit-exact integer model of the hardware
       │
       ├─▶ digitalify.verify         integer model  ≡  QONNX execution (qonnx.core.onnx_exec)
@@ -22,6 +22,8 @@ IRGraph  (integer IR: per-tensor bit widths, integer weights, requant constants)
 ```
 
 `verify` and `simulate` together close the loop: the generated hardware computes exactly what the QONNX model computes.
+
+The hardware is a **dataflow pipeline**: every tensor travels as a stream of beats with a valid/ready handshake, and every layer is a stage that can stall. The design rationale is in [docs/dataflow_design.md](docs/dataflow_design.md).
 
 ### Integer semantics
 
@@ -33,22 +35,30 @@ q_y[j] = clip( round( acc[j] · MULT[j] / 2^SHIFT[j] ) )        MULT/2^SHIFT = s
 ```
 
 * Every float32 scale is a dyadic rational, so with power-of-two scales (the usual choice in Brevitas, QKeras, hls4ml) `MULT / 2^SHIFT` is **exact**. Arbitrary scales use a 32-bit fixed-point multiplier (`max_mult_bits`).
-* Float (unquantised) biases — Brevitas' default — get `F` fractional accumulator bits (`max_bias_frac_bits`, default 16) instead of being rounded away.
+* Float (unquantised) biases — Brevitas' default — and folded BatchNorm offsets get `F` fractional accumulator bits (`max_bias_frac_bits`, default 16) instead of being rounded away.
 * All seven QONNX rounding modes are implemented in hardware: `ROUND` (half-even), `HALF_UP`, `HALF_DOWN`, `FLOOR`, `CEIL`, `UP`, `DOWN`.
 * Accumulator widths come from interval analysis of the actual weights and input range, so they never overflow and are no wider than needed.
 
 ## Supported patterns
 
-| QONNX pattern | IR op | Hardware |
-|---|---|---|
-| `Quant` on the graph input (or an input with an integer QONNX DataType) | — | Sets the input bus type and scale |
-| `MatMul` / `Gemm` with `Quant(W)` weights `[→ Add(bias)] [→ Relu] [→ Quant]` | `linear` | Combinational MAC, registered output with ReLU + requantisation (1 clock) |
-| `Relu` on a quantised tensor | `relu` | Combinational, 0 clocks |
-| `Flatten`, `Reshape`, `Identity`, `Squeeze`, `Unsqueeze` | — | Free (the bus is already flat) |
+| QONNX pattern | Hardware stages |
+|---|---|
+| `Quant` on the graph input (or an input with an integer QONNX DataType) | Sets the input stream type and scale |
+| `MatMul` / `Gemm` with `Quant(W)` weights | `linear` |
+| `Conv` 1-D / 2-D: any kernel, stride, zero padding, groups (depthwise) | `[pad] → swg → linear` |
+| … each followed by `[Add / Sub / Mul / Div by constants, BatchNormalization]… [Relu] [Quant]` | fused into the `linear` stage |
+| `MaxPool` (with padding) / `AveragePool` (no padding) | `[pad] → swg → pool` |
+| `GlobalAveragePool` | `global_pool` |
+| `Pad` (constant zero) | `pad` |
+| `Flatten` / `Reshape` of an image into a vector | `flatten` (weights of the next layer permuted) |
+| `Relu` | `relu` |
+| `[Relu] Quant` on a quantised tensor | `requant` |
+| Any chain of elementwise ops ending in `Quant` (`Sigmoid`, `Tanh`, `Clip`, `LeakyRelu`, `HardSigmoid`, `Elu`, `Mul`/`Add` by constants, …) | `lut` — a table computed by running the chain with qonnx, so it matches QONNX by construction (input range ≤ 4096 values) |
+| `Flatten`, `Reshape`, `Identity`, `Squeeze`, `Unsqueeze` on vectors | free |
 
 Weights can have any bit width and per-tensor or per-channel scales; each activation tensor has its own width and signedness (e.g. INT8 input → UINT4 hidden → INT8 output). If no `Quant` follows a layer, its accumulator is the output.
 
-Anything else raises `UnsupportedOperatorError` (unknown op, branching graph, re-quantising an already quantised tensor, bipolar 1-bit quantisation) or `QONNXImportError` (unquantised input or weights, non-zero zero-point) at import time, before any VHDL is written. Convolutions and skip connections are the next operators on the roadmap.
+Anything else raises `UnsupportedOperatorError` (unknown op, branching graph such as residual connections, dilation, bipolar 1-bit quantisation, ...) or `QONNXImportError` (unquantised input or weights, non-zero zero-point) at import time, before any VHDL is written. Residual connections and AXI4-Stream wrappers are next on the roadmap.
 
 ## Installation
 
@@ -66,71 +76,104 @@ import digitalify
 
 # 1 — a QONNX model, e.g. from Brevitas:
 #       from brevitas.export import export_qonnx
-#       export_qonnx(brevitas_model, torch.randn(1, 16), "model.onnx")
+#       export_qonnx(brevitas_model, torch.randn(1, 3, 32, 32), "model.onnx")
 model = "model.onnx"
 
 # 2 — inspect what will be built
 ir = digitalify.from_qonnx(model)
 print(ir.summary())
 
-# 3 — generate VHDL
+# 3 — generate VHDL (optionally folding the large layers, see below)
 files = digitalify.convert(model, output_dir="vhdl_out/")
 
 # 4 — check the integer hardware model against QONNX execution
 print(digitalify.verify(model).summary())
 # [PASSED]  64/64 vectors match QONNX, max error 0 LSB
 
-# 5 — simulate the generated VHDL with GHDL
+# 5 — simulate the generated VHDL with GHDL (random backpressure on both ends)
 print(digitalify.simulate(model).summary())
-# [PASSED]  16 passed, 0 failed
+# [PASSED]  16 passed, 0 failed, 1752 cycles (first output after 368)
 ```
 
-No model at hand? `digitalify.testing.make_mlp` builds QONNX MLPs (any widths, scales, rounding modes) with plain `onnx.helper`:
+No model at hand? `digitalify.testing` builds QONNX models with plain `onnx.helper`:
 
 ```python
-from digitalify.testing import make_mlp
-model = make_mlp([16, 8, 4], weight_bits=4, act_bits=6, output_bits=8)
+from digitalify.testing import make_cnn, make_mlp
+
+mlp = make_mlp([16, 8, 4], weight_bits=4, act_bits=6, output_bits=8)
+cnn = make_cnn((3, 32, 32), [
+    dict(type="conv", out=8, kernel=3, pad=1),          # + ReLU + 6-bit Quant
+    dict(type="maxpool"),
+    dict(type="conv", out=16, kernel=3, pad=1, bn=True),
+    dict(type="gap"),
+    dict(type="flatten"),
+    dict(type="linear", out=10, relu=False, bits=8),
+])
 ```
 
 See `examples/simple_network.ipynb` for a full walkthrough.
 
-## Generated VHDL structure
+## Generated hardware
 
-Each layer becomes a self-contained entity; a structural top level wires them together. Entity names are prefixed with the network name, so several networks can share a VHDL library:
+### Streams and handshake
+
+A tensor of shape `(C, H, W)` travels as `H·W` beats in raster order, one pixel (all `C` channels) per beat; a vector is a single beat. Inside a beat, element `i` with `B` bits is `data((i+1)*B-1 downto i*B)`. ONNX's NCHW layout is converted at the boundaries (`ir.onnx_to_stream` / `ir.stream_to_onnx`).
+
+Every stage and the top level have the same ports:
+
+```
+clk, rst
+in_valid,  in_ready,  in_data       -- a beat moves when valid and ready are both '1'
+out_valid, out_ready, out_data      -- (AXI4-Stream rules)
+```
+
+Each stage is a core that advances on a clock enable, followed by a two-register skid buffer whose registered `in_ready` is that enable. `out_ready` therefore never reaches `in_ready` combinationally: back-pressure costs no timing, however deep the network.
 
 ```
 vhdl_out/
-├── mlp_linear_0.vhd   # MatMul + bias + ReLU + requant, weights as constants
-├── mlp_linear_1.vhd
-└── mlp_top.vhd        # clk, rst, valid_i, data_i -> valid_o, data_o
+├── cnn_skid.vhd       # shared skid buffer
+├── cnn_pad_0.vhd      # zero border
+├── cnn_swg_0.vhd      # sliding window generator (line buffers)
+├── cnn_linear_0.vhd   # conv as a matrix-vector unit, weights as constants
+├── ...
+└── cnn_top.vhd        # stages wired with valid / ready / data
 ```
 
-Bus packing: element `i` of a bus with `B`-bit elements is `data((i+1)*B-1 downto i*B)`. A `valid` bit travels with the data; latency is 1 clock per `linear` layer (more with pipelining, below), and a new input vector can be accepted every clock.
+### Stages
 
-The linear component, in outline:
+| Stage | Function | Rate |
+|---|---|---|
+| `linear` | `requant(relu(W·x + b))` on every beat | 1 beat/clock; folded: 1 beat per `(out/PE)·(in/SIMD) + 1` clocks |
+| `pad` | border pixels of a constant value | emits `Hp·Wp` beats per `H·W` |
+| `swg` | `KH-1` line buffers + window registers → one `KH·KW·C` window per output position | 1 pixel/clock |
+| `pool` | per-channel max / sum over a window | 1/clock |
+| `global_pool` | per-channel sum over all pixels | 1 pixel/clock |
+| `flatten` | collects all pixels into one beat | 1 pixel/clock |
+| `relu`, `requant`, `lut` | elementwise | 1/clock |
 
-```vhdl
--- Combinational MAC at the exact width the weights need:
--- products, then a balanced adder tree (depth ceil(log2(IN_F)))
-for j in 0 to OUT_F - 1 loop
-    for i in 0 to IN_F - 1 loop
-        t(i) := resize(x(i) * WEIGHTS(j)(i), SUM_W);
-    end loop;
-    for k in 0 to 7 loop t(k) := t(2 * k) + t(2 * k + 1); end loop;   -- 16 -> 8
-    ...                                                               -- 8 -> 4 -> 2 -> 1
-    acc(j) <= shift_left(resize(t(0), ACC_W), F) + BIASES(j);
-end loop;
+A convolution is `[pad] → swg → linear`: the window beat feeds the same matrix-vector unit as a dense layer, with the weights reshaped to `(C_out, KH·KW·C_in)`. Grouped and depthwise convolutions use a block-sparse weight matrix whose zeros the synthesiser removes in fully parallel mode.
 
--- Output register: ReLU, then q = clip(round(acc * MULT / 2^SHIFT))
-p := resize(a * MULT(j), P_W);
-q := shift_right(p, SHIFT(j));            -- floor
-r := p and SHIFT_MASK(j);                 -- discarded bits drive the rounding
-if r > half or (r = half and q(0) = '1') then q := q + 1; end if;   -- ROUND
+### Folding: area vs throughput
+
+By default a `linear` stage is fully parallel: one multiplier per weight, one beat per clock. `folding={"stage": (PE, SIMD)}` computes `PE` neurons × `SIMD` inputs per clock instead, with the weights in a ROM:
+
+```python
+files = digitalify.convert(model, folding={"linear_0": (2, 3), "linear_1": (4, 8)})
 ```
+
+`PE` must divide the outputs and `SIMD` the inputs of the stage; stage names are listed by `ir.summary()`. Measured on the 32×32×3 CNN above (three convolutions, Artix-7 xc7a200t, out-of-context, post-synthesis):
+
+| Configuration | LUTs | FFs | BRAM tiles | fmax | Power |
+|---|---|---|---|---|---|
+| Fully parallel | 49 249 | 8 738 | 5.5 | 13 MHz | 2.79 W |
+| Fully parallel, `pipeline=True` | 59 799 | 74 514 | 5.5 | 132 MHz | 4.73 W |
+| Folded (`linear_0` 2×3, `linear_1`/`linear_2` 4×8, `linear_3` 2×4) | 8 172 | 11 231 | 5.5 | 55 MHz | 0.52 W |
+
+The line buffers map to block RAM. With full pipelining the critical path moves to the max-pool stage (a sequential compare over the window), which a comparison tree would shorten. In the folded unit the critical path runs from the weight-ROM address through the multiplier and the SIMD adder tree into the accumulator; registering the ROM output is the next improvement.
 
 ### Pipelining
 
-`convert(..., pipeline=...)` (also `simulate` and `VHDLGenerator(pipeline=...)`) adds optional registers inside every linear layer:
+`convert(..., pipeline=...)` (also `simulate` and `VHDLGenerator(pipeline=...)`) adds optional registers inside every fully parallel linear stage:
 
 ```
 products -[products]- tree level 1 -[tree]- level 2 -[tree]- ... last level
@@ -144,9 +187,9 @@ products -[products]- tree level 1 -[tree]- level 2 -[tree]- ... last level
 | `"acc"` | after the last tree level + bias | 1 |
 | `"mult"` | after the requantisation product (layers that requantise) | 1 |
 
-`pipeline` takes a stage name, a list of names, or `True` for every stage with the tree registered at every level; the default (`None`) adds nothing, leaving one register per layer. Each register adds one clock of latency; throughput stays one vector per clock.
+`pipeline` takes a stage name, a list of names, or `True` for every stage with the tree registered at every level; the default (`None`) adds nothing. Each register adds one clock of latency; throughput stays one beat per clock.
 
-Measured on the 16→8→4 example (4-bit weights; Artix-7 xc7a200t, out-of-context, post-synthesis estimates):
+Measured on the 16→8→4 MLP (4-bit weights; Artix-7 xc7a200t, out-of-context, post-synthesis estimates, before the streaming interface was added):
 
 | `pipeline` | Latency (cycles) | fmax | FFs | LUTs |
 |---|---|---|---|---|
@@ -157,24 +200,24 @@ Measured on the 16→8→4 example (4-bit weights; Artix-7 xc7a200t, out-of-cont
 | `["products", "tree", "acc"]` | 11 | 258 MHz | 2 125 | 1 704 |
 | `True` | 13 | 262 MHz | 2 263 | 1 744 |
 
-The MAC (products, adder tree, bias) is the long path; once it is cut, the remaining limit is the ReLU + requantisation + rounding stage.
-
 ## Testing
 
 ```bash
 pytest tests          # GHDL tests are skipped if GHDL is not found
 ```
 
-The suite checks the rounding arithmetic, the importer's error handling and, for a matrix of models (mixed precision, odd widths, unsigned input, float bias, Gemm, per-channel and non-power-of-two scales, every rounding mode, ...), both `verify` (reference vs QONNX) and `simulate` (VHDL vs reference), the latter with and without pipelining. The generated testbench streams one vector per clock with periodic idle cycles and checks every clock that `valid_o` is high exactly when a result is due, so a wrong latency or a misaligned `valid` fails the test.
+The suite checks the rounding arithmetic, the importer's error handling and, for a matrix of MLPs (mixed precision, odd widths, unsigned input, float bias, Gemm, per-channel and non-power-of-two scales, every rounding mode, ...) and CNNs (padding, stride, max / average / global pooling, BatchNorm, depthwise, 1-D convolution, lookup-table activations, flatten of an image, ...), both `verify` (reference vs QONNX) and `simulate` (VHDL vs reference), with pipelining and folding.
+
+The generated testbench streams every beat of several test tensors back to back while throttling `in_valid` and `out_ready` pseudo-randomly. It compares every output beat in order, checks that a stalled output holds its valid and data, fails on a timeout, and reports the cycle count (`GHDLResult.cycles`, `first_output`). With `simulate(..., backpressure=False)` the cycle count measures full throughput.
 
 ## Extending the library
 
-Adding an operator takes four steps:
+Adding a stage takes four steps:
 
-1. **Frontend** — map the QONNX pattern to an `IRNode` in `digitalify/frontend/qonnx_importer.py`.
-2. **Hardware** — subclass `VHDLOperator` (`digitalify/operators/`) and implement `architecture(node, entity)`; set `latency` and `clocked` (override `node_latency(node)` if the latency depends on the node or on the `pipeline` option).
+1. **Frontend** — lower the QONNX pattern to `IRNode`s in `digitalify/frontend/qonnx_importer.py`.
+2. **Hardware** — subclass `VHDLOperator` (`digitalify/operators/`) and implement `core(node)`: logic that advances when `ce = '1'`, drives `in_ready` and the output register `core_valid` / `core_data`. The base class adds the ports and the skid buffer.
 3. **Register** it in `digitalify/operators/registry.py`.
-4. **Reference** — add its bit-exact model to `digitalify/testing/reference.py`, then a variant to `tests/test_end_to_end.py`.
+4. **Reference** — add its bit-exact model to `digitalify/testing/reference.py`, then a variant to `tests/test_cnn.py` or `tests/test_end_to_end.py`.
 
 ## Design decisions
 
@@ -184,8 +227,11 @@ QONNX is framework-neutral: Brevitas, QKeras (via `qonnx.converters`) and hls4ml
 **Why bit-exact integer arithmetic?**
 The hardware should not just approximate the trained model: with power-of-two scales it reproduces the QONNX model's outputs exactly, which makes regressions trivially detectable.
 
+**Why streams with valid / ready?**
+Layers run at different rates (pooling, folded units, line buffers filling up), so every stage must be able to stall. The handshake is the AXI4-Stream / Avalon-ST one, which keeps vendor wrappers thin, and the registered skid buffers keep the ready path short.
+
 **Why hard-coded weight constants?**
-The design is self-contained: no external memory, DMA or boot sequence, and the synthesiser can constant-fold multiplications by small weights into LUTs. The fully parallel MAC trades area for latency; it suits small networks, and larger ones will need a folded/pipelined architecture.
+The design is self-contained: no external memory, DMA or boot sequence, and the synthesiser can constant-fold multiplications by small weights into LUTs. Folding moves the weights into ROMs when a layer is too large to unroll.
 
 ## Project structure
 
@@ -197,24 +243,26 @@ digitalify/
 ├── verify.py                 # integer model vs QONNX execution
 ├── ir/
 │   ├── types.py              # IntType (bits, signedness)
-│   ├── node.py               # IRNode
-│   └── graph.py              # IRGraph (nodes, bus types, scales)
+│   ├── node.py               # IRNode (stream shapes)
+│   └── graph.py              # IRGraph (nodes, stream types, scales, layout conversion)
 ├── frontend/
-│   └── qonnx_importer.py     # QONNX model → IRGraph
+│   └── qonnx_importer.py     # QONNX model → IRGraph (lowering to stages)
 ├── operators/
-│   ├── base.py               # abstract VHDLOperator
+│   ├── base.py               # VHDLOperator, ports, skid buffer, pipeline option
 │   ├── registry.py           # op_type → handler class
-│   ├── linear.py             # LinearOperator
-│   └── activations.py        # ReLUOperator
+│   ├── linear.py             # fully parallel and folded matrix-vector unit
+│   ├── window.py             # pad, swg, pool, global_pool, flatten
+│   └── activations.py        # relu, lut, requant
 ├── backend/vhdl/
 │   ├── generator.py          # IRGraph → {filename: VHDL}
 │   └── naming.py             # VHDL identifier sanitising
 └── testing/
-    ├── qonnx_builder.py      # make_mlp(): QONNX models without PyTorch
+    ├── qonnx_builder.py      # make_mlp(), make_cnn(): QONNX models without PyTorch
     ├── reference.py          # bit-exact integer model + test vectors
-    ├── tb_generator.py       # self-checking VHDL testbench
+    ├── tb_generator.py       # self-checking streaming VHDL testbench
     └── ghdl_runner.py        # GHDL analyse / elaborate / run
 
+docs/dataflow_design.md       # architecture of the streaming hardware
 tests/                        # pytest suite
 examples/simple_network.ipynb # end-to-end walkthrough
 vivado_api/                   # REST service for remote Vivado synthesis (below)

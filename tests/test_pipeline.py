@@ -8,7 +8,7 @@ from digitalify.operators.base import normalize_pipeline
 from digitalify.operators.linear import LinearOperator
 from digitalify.testing import make_mlp
 from digitalify.testing.ghdl_runner import run_ghdl
-from digitalify.testing.tb_generator import generate_testbench, stream_schedule
+from digitalify.testing.tb_generator import generate_testbench
 
 
 @pytest.fixture(scope="module")
@@ -42,15 +42,17 @@ def test_convert_rejects_bad_pipeline():
 
 
 # 16 -> 8 -> 4: tree depth 4 (16 inputs) and 3 (8 inputs); both layers requantise.
+# Core latency of the two linear stages (clocks from input beat to output register).
 @pytest.mark.parametrize("pipeline,latency", [
     (None, 2), ("acc", 4), ("mult", 4), ("products", 4),
     ("tree", 2 + 3 + 2), ("tree:2", 2 + 1 + 1), ("tree:4", 2),
     (True, 7 + 6),
 ])
 def test_latency(ir, pipeline, latency):
-    assert VHDLGenerator(pipeline).latency(ir) == latency
+    op = LinearOperator(pipeline)
+    assert sum(op.node_latency(n) for n in ir.nodes) == latency
     top = VHDLGenerator(pipeline).generate(ir)[f"{ir.name}_top.vhd"]
-    assert f"-- Latency: {latency} clock cycle(s)" in top
+    assert ("-- Pipeline:" in top) == (pipeline is not None)
 
 
 def test_single_input_layer_has_no_tree_registers():
@@ -70,7 +72,7 @@ def test_mult_stage_needs_requantisation():
 def test_registers_only_when_enabled(ir):
     plain = digitalify.convert(ir)
     piped = digitalify.convert(ir, pipeline=True)
-    layer = next(f for f in plain if not f.endswith("_top.vhd"))
+    layer = f"{ir.name}_linear_0.vhd"
     assert "acc_reg" not in plain[layer] and "mult_reg" not in plain[layer]
     assert "acc_reg" in piped[layer] and "mult_reg" in piped[layer]
     assert "mac_reg0" in piped[layer] and "mac_reg" not in plain[layer]
@@ -98,16 +100,15 @@ def test_adder_tree_sums_everything(n):
     assert t[0] == n * (n + 1) // 2
 
 
-def test_stream_schedule_has_idle_cycles():
-    assert stream_schedule(7) == [0, 1, 2, -1, 3, 4, 5, -1, 6]
-    assert stream_schedule(3) == [0, 1, 2]
-
-
-def test_testbench_detects_wrong_latency(ir, ghdl):
-    """Pipelined VHDL checked against the unpipelined timing must fail."""
+def test_testbench_detects_wrong_output(ir, ghdl):
+    """A testbench expecting a different first output beat must fail."""
     vhdl = VHDLGenerator(True).generate(ir)
-    tb_name, tb_src = generate_testbench(ir, n_vectors=6, pipeline=None)
+    tb_name, tb_src = generate_testbench(ir, n_vectors=6)
+    head, tail = tb_src.split("constant EXPECTED : out_array_t := (", 1)
+    first = tail.index('"') + 1
+    flipped = "1" if tail[first] == "0" else "0"
+    tb_src = head + "constant EXPECTED : out_array_t := (" + tail[:first] + flipped + tail[first + 1:]
     result = run_ghdl(vhdl_files=vhdl, tb_filename=tb_name, tb_source=tb_src,
                       tb_entity=f"tb_{ir.name}", ghdl_path=ghdl)
     assert not result.passed
-    assert result.n_failed > 0
+    assert result.n_failed == 1 and result.n_passed == 5

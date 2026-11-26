@@ -160,7 +160,7 @@ class UtilizationReport(BaseModel):
     lut_ram:      int | None = None
     flip_flops:   int | None = None
     dsps:         int | None = None
-    brams:        int | None = None
+    brams:        float | None = None   # 36 Kb tiles; a RAMB18 counts as 0.5
     ios:          int | None = None
     lut_pct:      float | None = None
     ff_pct:       float | None = None

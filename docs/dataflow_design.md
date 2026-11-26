@@ -1,0 +1,208 @@
+# Dataflow architecture
+
+Design for moving digitalify from "one vector in, one vector out" MLPs to a
+general streaming dataflow architecture that supports CNNs and other layer
+types, on any FPGA vendor.
+
+Status: (1) streaming core, (2) Conv / pooling and (3) common QONNX layers are
+implemented and verified (bit-exact in GHDL with random backpressure, and
+synthesised with Vivado).  Residual graphs and an AXI4-Stream wrapper come later.
+
+## Goals
+
+* Support convolutional networks and the layer types common in QONNX
+  exports (Brevitas, QKeras, FINN), not just MLPs.
+* Stay vendor-neutral: plain VHDL-2008, no vendor primitives or IP.
+* Keep bit-exactness: every generated design is checked against the integer
+  reference model in simulation, and the reference model against QONNX.
+* Let the user trade area for throughput per layer.
+
+Non-goals for now: residual / branching graphs (needs FIFOs to balance
+branches), memory-mapped weights (weights stay constants), multi-clock designs.
+
+## 1. Streams
+
+Every tensor travels as a **stream of beats**.
+
+* A tensor has a stream shape `(H, W, C)`.  One beat carries one pixel: its
+  `C` elements, packed as today (element `c` at `data((c+1)*B-1 downto c*B)`).
+  Beats come in raster order (row by row, left to right).
+* A plain vector is the special case `(1, 1, N)`: one beat per vector, which
+  is exactly the current MLP interface.
+* ONNX tensors are NCHW.  The importer maps a 3-D activation `(C, H, W)` to the
+  stream `(H, W, C)`.  It permutes the weights of a `Flatten → MatMul`, so the
+  hardware can flatten in HWC order while the maths stays identical.
+* A network input of rank 3 is streamed as an image only when it feeds a
+  convolution or pooling layer; otherwise it is flattened to one vector beat.
+
+The bus width is `C × bits`, fixed per tensor.  Within one beat, channel
+parallelism is total; folding (section 4) happens inside the compute units,
+not on the bus.
+
+## 2. Handshake
+
+Every stage, and the top level, has the same ports:
+
+```
+clk, rst
+in_valid,  in_ready,  in_data      -- upstream
+out_valid, out_ready, out_data     -- downstream
+```
+
+A beat moves when `valid = '1'` and `ready = '1'` on the same rising edge,
+with AXI4-Stream rules: a source never waits for `ready` before asserting
+`valid`, and once `valid` is asserted, it and the data are held until the
+transfer.  The same handshake maps directly onto AXI4-Stream (`tvalid`/`tready`/
+`tdata`) and Intel Avalon-ST, so vendor wrappers stay thin.
+
+### Stage structure: core + skid buffer
+
+```
+            ce                     ┌───────────────┐
+in ──► [ stage core ] core_valid ─►│  skid buffer  │──► out
+            ▲          core_data   │ (2 registers) │
+            └────────── ce ◄───────┤ in_ready (reg)│◄── out_ready
+                                   └───────────────┘
+```
+
+* The **core** holds all the logic and registers, and advances only when
+  `ce = '1'`.  With `ce = '0'` it freezes completely.  Its output register
+  (`core_valid`, `core_data`) is consumed on every `ce = '1'` edge.
+* **`ce` is the skid buffer's `in_ready`**, which is a register output.
+  So no stage has a combinational path from `out_ready` to `in_ready`: the ready
+  signal never ripples through the network, and the timing of a deep network
+  does not degrade.
+* Cores accept input with `in_ready = ce and <core can accept>`, where the
+  second term comes from the core's own state registers.
+* Cost: two output registers per stage.
+
+Pipelines inside a core (the `pipeline` option of `linear`) use the same `ce`,
+so they keep working unchanged, now stallable.
+
+## 3. Hardware stages
+
+Each ONNX pattern is lowered into a chain of small stages.  Composition keeps
+every stage simple and testable on its own.
+
+| Stage | Function | Rate |
+|---|---|---|
+| `linear` | `y = requant(relu(W·x + b))` per beat (matrix-vector unit) | 1 beat/clock when fully parallel; folded: 1 beat per `NF·SF + 1` clocks |
+| `relu` | `max(0, x)` per element | 1/clock |
+| `pad` | inserts border pixels with a constant value | emits `Hp·Wp` beats per `H·W` input beats |
+| `swg` | sliding window generator: line buffers + window registers; emits a `KH·KW·C` window beat per output position (stride applied) | 1 input beat/clock |
+| `pool` | per-channel max or sum over a window beat | 1/clock |
+| `global_pool` | per-channel sum over all `H·W` beats → one beat | 1 input beat/clock |
+| `flatten` | collects `H·W` beats into one `(1, 1, H·W·C)` beat | 1 input beat/clock |
+| `lut` | elementwise table lookup (any activation followed by `Quant`) | 1/clock |
+| `requant` | elementwise `clip(round(x·m / 2^n))` (a standalone `Quant`) | 1/clock |
+
+ONNX lowering:
+
+* **Conv** (any kernel, stride, padding, groups): `[pad] → swg → linear`.  The
+  window beat order is `(kh, kw, c)`, and the weights are reshaped to
+  `(C_out, KH·KW·C_in)` in that order.  Grouped and depthwise convolutions use a
+  block-sparse weight matrix: zero weights are constant-folded away in fully
+  parallel mode.  A 1×1 convolution with stride 1 and no padding is a bare
+  `linear` on the pixel stream.
+* **MaxPool / AveragePool**: `[pad] → swg → pool`.  MaxPool pads with the
+  smallest value of the input type.  AveragePool becomes a window sum whose
+  scale is divided by `KH·KW` (padding is not supported, since
+  `count_include_pad` would change the divisor per position).
+* **GlobalAveragePool**: `global_pool`, with scale divided by `H·W`.
+* **BatchNormalization** and per-channel `Mul` / `Add` by constants directly
+  after a Conv / MatMul / Gemm are folded into the `linear` stage: they change
+  the accumulator scale and the bias, and a negative factor flips the sign of
+  that channel's weights.  The existing fractional-bias mechanism keeps
+  non-integer biases exact up to `F` bits.
+* **Activations other than ReLU** (Sigmoid, Tanh, Clip/HardTanh, LeakyRelu,
+  HardSigmoid, Elu, ...), and any chain of elementwise ops ending in a `Quant`,
+  become a `lut`.  The table is computed by running that ONNX sub-graph with
+  qonnx on every possible input value, so it matches QONNX by construction.
+  This requires a small input range (at most 4096 values per channel).
+* **Quant** on an already quantised tensor becomes a `requant` stage.
+* **Flatten** of a spatial tensor becomes a `flatten` stage, plus the column
+  permutation of the following weights.  Of a `(1, 1, C)` tensor, it is a no-op.
+
+## 4. Folding (area / throughput)
+
+`linear` takes two parallelism parameters per layer:
+
+* `PE`: output neurons computed in parallel (divides `out_features`);
+* `SIMD`: inputs multiplied in parallel per neuron (divides `in_features`).
+
+`PE = out`, `SIMD = in` is the current fully parallel unit (one beat per clock,
+with the `pipeline` options).  Otherwise the unit is folded:
+
+* It needs `PE·SIMD` multipliers and takes `NF·SF` clocks per beat, where
+  `NF = out/PE` and `SF = in/SIMD`.
+* The input vector is latched and rotated by `SIMD` elements per clock.
+* The weights live in a constant ROM indexed by the fold counters.  Synthesis
+  maps it to LUTs or block RAM.
+* `PE` accumulators sum over `SF` clocks.  A finalisation register then adds
+  the bias, applies ReLU and requantises `PE` neurons per clock into the output
+  vector, and the output beat goes out after the last neuron group.
+
+The user passes `folding={"linear_0": (PE, SIMD), ...}` to `convert` /
+`simulate`.  Layers not listed stay fully parallel.  A helper that chooses
+`PE`/`SIMD` for a target throughput can come later; the interface does not
+depend on it.
+
+For a convolution, one output pixel is one `linear` beat, so the frame rate is
+`Ho·Wo / (beats per clock of the slowest stage) / f_clk`.  Folding the `linear`
+of a conv layer trades multipliers against frame rate in exactly that ratio.
+
+## 5. Bit-exactness and verification
+
+* **Reference model** (`digitalify.testing.reference`): operates on
+  `(n, H, W, C)` integer tensors, one function per stage.  It is the
+  specification of the hardware.
+* **`verify`**: converts stream-order integers to NCHW, runs QONNX and maps
+  the outputs back.  Float-only steps (BatchNorm folding, non-dyadic scales,
+  average divisors) can differ by one LSB at rounding ties.  These are reported
+  as approximate, as the requantisation is today.
+* **`simulate`**: a new streaming testbench.
+  * It sends all beats of `n` test tensors back to back.  With
+    `backpressure=True` (the default), it drives `in_valid` and `out_ready`
+    from pseudo-random patterns.
+  * It compares every output beat in order and counts a test tensor as passed
+    when all of its beats match.
+  * It checks the protocol: `out_valid` and `out_data` must stay stable while
+    `out_ready = '0'`.
+  * It fails on a timeout if beats are missing.
+  * It reports cycle counts (first output, total), so throughput and latency
+    are measured rather than computed.  Exact cycle-latency checks are dropped,
+    because with stalls latency is not a constant any more.
+
+## 6. Code layout
+
+```
+digitalify/
+├── ir/                       IRNode shapes become stream shapes (H, W, C)
+├── frontend/qonnx_importer   lowering of the ONNX patterns above
+├── operators/
+│   ├── base.py               ports, core/skid wrapping, pipeline option
+│   ├── skid.py               shared skid-buffer entity (<net>_skid)
+│   ├── linear.py             fully parallel + folded MVAU
+│   ├── window.py             pad, swg, pool, global_pool, flatten
+│   └── elementwise.py        relu, lut, requant
+├── backend/vhdl/generator    top level wires valid/ready/data between stages
+└── testing/                  reference model, streaming testbench, CNN builder
+```
+
+## 7. Later
+
+* Residual `Add` / `Concat` (DAG graphs with balancing FIFOs).
+* AXI4-Stream / Avalon-ST top-level wrappers.
+* Block-RAM line buffers with synchronous read, for large images (the first
+  version uses distributed RAM with asynchronous read).
+* Automatic folding for a target throughput or resource budget.
+* Overlapping input and computation in folded `linear` (removes the one-clock
+  bubble per beat).
+* Registering the weight-ROM output and the products in folded `linear`.  The
+  first Vivado runs put its critical path there: ROM address → multiplier →
+  SIMD adder tree → accumulator, about 18 ns.
+* A comparison / adder tree in `pool`.  With fully pipelined linear stages the
+  sequential max over the window becomes the critical path (7.5 ns on Artix-7).
+* Padding inside the window generator.  A separate `pad` stage emits
+  `Hp·Wp` beats per `H·W` input pixels, so a padded 3×3 convolution on a small
+  image runs at `H·W / (Hp·Wp)` of the input rate (64/100 on 8×8).

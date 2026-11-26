@@ -50,6 +50,10 @@ class GHDLResult:
     work_dir : Path
         Directory containing all intermediate files.  Deleted automatically
         unless ``keep_work_dir=True`` was passed to ``run_ghdl``.
+    cycles : int | None
+        Clock cycles from the end of reset to the last output beat.
+    first_output : int | None
+        Clock cycles from the end of reset to the first output beat.
     """
     passed:    bool
     n_passed:  int
@@ -57,11 +61,15 @@ class GHDLResult:
     log:       str
     vcd_path:  Path | None
     work_dir:  Path
+    cycles:    int | None = None
+    first_output: int | None = None
 
     def summary(self) -> str:
         status = "PASSED" if self.passed else "FAILED"
         return (
             f"[{status}]  {self.n_passed} passed, {self.n_failed} failed"
+            + (f", {self.cycles} cycles (first output after {self.first_output})"
+               if self.cycles is not None else "")
             + (f"  (VCD: {self.vcd_path})" if self.vcd_path else "")
         )
 
@@ -126,6 +134,7 @@ def _simulate(
     if vcd:
         cmd.append(f"--vcd={work_dir / 'waveform.vcd'}")
     cmd.append(f"--stop-time={stop_time}")
+    cmd.append("--ieee-asserts=disable-at-0")
     return _run(cmd, cwd=work_dir)
 
 
@@ -186,7 +195,7 @@ def run_ghdl(
     work_dir: Path | None = None,
     keep_work_dir: bool = False,
     vcd: bool = True,
-    stop_time: str = "1ms",
+    stop_time: str = "1000ms",
 ) -> GHDLResult:
     """
     Run a full GHDL analyze → elaborate → simulate cycle.
@@ -280,6 +289,7 @@ def run_ghdl(
 
         full_log = "\n".join(log_lines)
         n_passed, n_failed = _parse_counts(full_log)
+        stats = re.search(r"TB STATS: cycles=(\d+) first_output=(-?\d+)", full_log)
         passed = (rc == 0) and (n_failed == 0) and (n_passed > 0)
 
         vcd_path = work_dir / "waveform.vcd"
@@ -294,6 +304,8 @@ def run_ghdl(
             log=full_log,
             vcd_path=vcd_path,
             work_dir=work_dir,
+            cycles=int(stats.group(1)) if stats else None,
+            first_output=int(stats.group(2)) if stats else None,
         )
 
     finally:

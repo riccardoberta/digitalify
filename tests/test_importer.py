@@ -49,7 +49,7 @@ def test_name_override_and_sanitising():
 
 def test_convert_writes_files(tmp_path):
     files = convert(make_mlp([8, 4, 2]), output_dir=str(tmp_path))
-    assert set(files) == {"mlp_linear_0.vhd", "mlp_linear_1.vhd", "mlp_top.vhd"}
+    assert list(files) == ["mlp_skid.vhd", "mlp_linear_0.vhd", "mlp_linear_1.vhd", "mlp_top.vhd"]
     assert (tmp_path / "mlp_top.vhd").read_text().startswith("-- Top-level")
 
 

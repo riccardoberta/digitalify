@@ -62,6 +62,16 @@ def _int_val(text: str, label: str, col: int = 1) -> int | None:
         return None
 
 
+def _float_val(text: str, label: str, col: int = 1) -> float | None:
+    v = _table_value(text, label, col)
+    if v is None:
+        return None
+    try:
+        return float(v.replace(",", "").strip())
+    except ValueError:
+        return None
+
+
 def _float_pct(text: str, label: str) -> float | None:
     """Extract the Util% column (last numeric column) for *label*."""
     # Util% is the 5th column after the label
@@ -80,7 +90,7 @@ def parse_utilization(report: str) -> dict:
         "lut_ram":    _int_val(report,  "LUT as Memory"),
         "flip_flops": _int_val(report,  "Slice Registers"),
         "dsps":       _int_val(report,  "DSPs"),
-        "brams":      _int_val(report,  "Block RAM Tile"),
+        "brams":      _float_val(report, "Block RAM Tile"),   # RAMB18 counts as 0.5
         "ios":        _int_val(report,  "Bonded IOB"),
         "lut_pct":    _float_pct(report,"Slice LUTs"),
         "ff_pct":     _float_pct(report,"Slice Registers"),

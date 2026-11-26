@@ -40,3 +40,12 @@ def test_missing_table_gives_none():
     t = parse_timing("No timing information: design has no clocks\n")
     assert t == {"wns_ns": None, "tns_ns": None, "whs_ns": None, "ths_ns": None,
                  "timing_met": None}
+
+
+def test_fractional_bram_tiles():
+    from vivado.parsers import parse_utilization
+    report = """| Block RAM Tile    |  5.5 |     0 |          0 |       365 |  1.51 |
+|   RAMB36/FIFO*    |    4 |     0 |          0 |       365 |  1.10 |
+"""
+    u = parse_utilization(report)
+    assert u["brams"] == 5.5 and u["bram_pct"] == 1.51

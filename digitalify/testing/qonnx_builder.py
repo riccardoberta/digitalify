@@ -170,3 +170,168 @@ def make_mlp(
     )
     model.ir_version = 8
     return model
+
+
+def make_cnn(
+    input_shape: Sequence[int],
+    layers: Sequence[dict],
+    *,
+    input_bits: int = 8,
+    input_signed: bool = True,
+    weight_bits: int = 4,
+    act_bits: int = 6,
+    seed: int = 0,
+    name: str = "cnn",
+) -> onnx.ModelProto:
+    """
+    Build a quantised network over an image ``(C, H, W)`` or a sequence
+    ``(C, L)`` as a QONNX ``ModelProto`` (NCHW, as Brevitas exports it).
+
+    Each entry of *layers* is a dict with a ``type`` key:
+
+    * ``conv``: ``out``, ``kernel`` (3), ``stride`` (1), ``pad`` (0), ``groups``
+      (1), ``bias`` (True), ``bn`` (False: BatchNormalization after the conv),
+      ``relu`` (True), ``bits`` (output Quant bits; ``None`` = no Quant).
+    * ``linear``: ``out``, ``bias``, ``relu``, ``bits`` - on a flat tensor.
+    * ``maxpool`` / ``avgpool``: ``kernel`` (2), ``stride`` (= kernel), ``pad`` (0).
+    * ``gap``: GlobalAveragePool.
+    * ``flatten``: Flatten (axis 1).
+    * ``act``: ``fn`` (ONNX op, e.g. "Sigmoid", "Tanh", "LeakyRelu"), ``bits``,
+      ``signed`` (True): activation followed by a Quant.
+    * ``quant``: ``bits``, ``signed``, ``scale``: a standalone Quant.
+
+    Scales are powers of two unless BatchNorm or average pooling make the
+    arithmetic non-dyadic.
+    """
+    rng = np.random.default_rng(seed)
+    nodes, inits = [], []
+    counter = [0]
+
+    def const(name, value):
+        inits.append(numpy_helper.from_array(np.asarray(value, dtype=np.float32), name))
+        return name
+
+    def uid(prefix):
+        counter[0] += 1
+        return f"{prefix}{counter[0]}"
+
+    def pow2(lo=2, hi=6):
+        return np.float32(2.0 ** -int(rng.integers(lo, hi + 1)))
+
+    def quant(inp, scale, bits, signed, narrow=False, out=None):
+        out = out or uid("q")
+        nodes.append(helper.make_node(
+            "Quant", [inp, const(f"{out}_s", scale), const(f"{out}_z", 0.0),
+                      const(f"{out}_b", float(bits))],
+            [out], domain=QONNX_DOMAIN, name=f"Quant_{out}",
+            signed=int(signed), narrow=int(narrow), rounding_mode="ROUND"))
+        return out
+
+    shape = list(input_shape)              # (C, *spatial)
+    x = quant("global_in", pow2(), input_bits, input_signed)
+
+    for li, spec in enumerate(layers):
+        kind = spec["type"]
+        last = li == len(layers) - 1
+        out_name = "global_out" if last else None
+        if kind == "conv":
+            c_in, nd = shape[0], len(shape) - 1
+            c_out, groups = spec["out"], spec.get("groups", 1)
+            k, st, pd = spec.get("kernel", 3), spec.get("stride", 1), spec.get("pad", 0)
+            s_w = pow2(3, 6)
+            w = rng.integers(-(2 ** (weight_bits - 1)) + 1, 2 ** (weight_bits - 1),
+                             size=(c_out, c_in // groups, *([k] * nd))) * s_w
+            wq = quant(const(uid("W"), w), s_w, weight_bits, True, narrow=True)
+            ins = [x, wq]
+            if spec.get("bias", True):
+                ins.append(const(uid("b"), rng.integers(-32, 32, size=c_out) * s_w * 2.0 ** -3))
+            y = uid("conv")
+            nodes.append(helper.make_node(
+                "Conv", ins, [y], name=f"Conv_{y}", kernel_shape=[k] * nd, strides=[st] * nd,
+                pads=[pd] * (2 * nd), group=groups))
+            shape = [c_out] + [(d + 2 * pd - k) // st + 1 for d in shape[1:]]
+            x = y
+            if spec.get("bn"):
+                bn = [const(uid("bn"), v) for v in (
+                    rng.uniform(0.5, 1.5, c_out), rng.uniform(-0.5, 0.5, c_out),
+                    rng.uniform(-0.5, 0.5, c_out), rng.uniform(0.5, 2.0, c_out))]
+                y = uid("bn")
+                nodes.append(helper.make_node("BatchNormalization", [x, *bn], [y], name=f"BN_{y}",
+                                              epsilon=1e-5))
+                x = y
+        elif kind == "linear":
+            fin = int(np.prod(shape))
+            fout = spec["out"]
+            s_w = pow2(3, 6)
+            w = rng.integers(-(2 ** (weight_bits - 1)) + 1, 2 ** (weight_bits - 1), size=(fin, fout)) * s_w
+            wq = quant(const(uid("W"), w), s_w, weight_bits, True, narrow=True)
+            y = uid("mm")
+            nodes.append(helper.make_node("MatMul", [x, wq], [y], name=f"MatMul_{y}"))
+            x = y
+            if spec.get("bias", True):
+                y = uid("add")
+                nodes.append(helper.make_node(
+                    "Add", [x, const(uid("b"), rng.integers(-32, 32, size=fout) * s_w * 2.0 ** -3)],
+                    [y], name=f"Add_{y}"))
+                x = y
+            shape = [fout]
+        elif kind in ("maxpool", "avgpool"):
+            nd = len(shape) - 1
+            k = spec.get("kernel", 2)
+            st = spec.get("stride", k)
+            pd = spec.get("pad", 0)
+            y = uid("pool")
+            nodes.append(helper.make_node(
+                "MaxPool" if kind == "maxpool" else "AveragePool", [x], [y], name=f"Pool_{y}",
+                kernel_shape=[k] * nd, strides=[st] * nd, pads=[pd] * (2 * nd)))
+            shape = [shape[0]] + [(d + 2 * pd - k) // st + 1 for d in shape[1:]]
+            x = y
+        elif kind == "gap":
+            y = uid("gap")
+            nodes.append(helper.make_node("GlobalAveragePool", [x], [y], name=f"GAP_{y}"))
+            shape = [shape[0]] + [1] * (len(shape) - 1)
+            x = y
+        elif kind == "flatten":
+            y = uid("flat")
+            nodes.append(helper.make_node("Flatten", [x], [y], axis=1, name=f"Flatten_{y}"))
+            shape = [int(np.prod(shape))]
+            x = y
+        elif kind == "act":
+            y = uid("act")
+            attrs = {"alpha": 0.125} if spec["fn"] == "LeakyRelu" else {}
+            nodes.append(helper.make_node(spec["fn"], [x], [y], name=f"Act_{y}", **attrs))
+            x = quant(y, pow2(2, 5), spec.get("bits", act_bits), spec.get("signed", True), out=out_name)
+            continue
+        elif kind == "quant":
+            x = quant(x, np.float32(spec.get("scale", pow2(1, 4))), spec.get("bits", act_bits),
+                      spec.get("signed", True), out=out_name)
+            continue
+        else:
+            raise ValueError(f"unknown layer type {kind!r}")
+
+        if kind in ("conv", "linear"):
+            relu = spec.get("relu", True)
+            if relu:
+                y = uid("relu")
+                nodes.append(helper.make_node("Relu", [x], [y], name=f"Relu_{y}"))
+                x = y
+            bits = spec.get("bits", act_bits)
+            if bits is not None:
+                x = quant(x, pow2(1, 4), bits, not relu, out=out_name)
+                continue
+        if last:
+            nodes.append(helper.make_node("Identity", [x], ["global_out"], name="Identity_out"))
+
+    graph = helper.make_graph(
+        nodes, name,
+        [helper.make_tensor_value_info("global_in", TensorProto.FLOAT, [1, *input_shape])],
+        [helper.make_tensor_value_info("global_out", TensorProto.FLOAT, [1, *shape])],
+        initializer=inits,
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid(QONNX_DOMAIN, 1)],
+        producer_name="digitalify.testing.qonnx_builder",
+    )
+    model.ir_version = 8
+    return model

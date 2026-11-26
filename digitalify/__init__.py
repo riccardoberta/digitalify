@@ -28,7 +28,7 @@ from digitalify.verify import VerificationResult, verify
 
 
 def convert(model, output_dir: str | None = None, name: str | None = None,
-            pipeline=None) -> dict[str, str]:
+            pipeline=None, folding=None) -> dict[str, str]:
     """
     High-level entry point: QONNX → IR → VHDL.
 
@@ -47,6 +47,10 @@ def convert(model, output_dir: str | None = None, name: str | None = None,
         bias), ``"mult"`` (after the requantisation product); ``True`` for
         all of them.  Default: none (one register per layer).  Each
         register adds one clock of latency and shortens the critical path.
+    folding : dict, optional
+        ``{linear_stage_name: (PE, SIMD)}``: compute that stage with
+        ``PE·SIMD`` multipliers over ``(out/PE)·(in/SIMD)`` clocks per beat
+        instead of fully in parallel.  Stage names are in ``ir.summary()``.
 
     Returns
     -------
@@ -54,7 +58,7 @@ def convert(model, output_dir: str | None = None, name: str | None = None,
         ``{filename: vhdl_source}``; the top level is ``<name>_top.vhd``.
     """
     ir = model if isinstance(model, IRGraph) else from_qonnx(model, name=name)
-    files = VHDLGenerator(pipeline).generate(ir)
+    files = VHDLGenerator(pipeline, folding).generate(ir)
 
     if output_dir is not None:
         import os
@@ -75,13 +79,18 @@ def simulate(
     vcd: bool = False,
     name: str | None = None,
     pipeline=None,
+    folding=None,
+    backpressure: bool = True,
 ):
     """
     QONNX → VHDL → self-checking testbench → GHDL simulation.
 
     The testbench compares the VHDL against the bit-exact integer reference
     model; use :func:`verify` to compare that reference with the original
-    QONNX model.  ``pipeline`` has the same meaning as in :func:`convert`.
+    QONNX model.  ``pipeline`` and ``folding`` have the same meaning as in
+    :func:`convert`.  With ``backpressure`` (default) the testbench throttles
+    ``in_valid`` and ``out_ready`` pseudo-randomly; with False the reported
+    cycle count measures full throughput.
     Requires GHDL ≥ 3.0 (on PATH, in ``DIGITALIFY_GHDL``, or passed as
     ``ghdl_path``).
 
@@ -89,7 +98,8 @@ def simulate(
     -------
     GHDLResult
         ``passed``, ``n_passed``, ``n_failed``, ``log``, ``vcd_path``,
-        ``work_dir``; ``.summary()`` gives a one-line status.
+        ``work_dir``, ``cycles``, ``first_output``; ``.summary()`` gives a
+        one-line status.
     """
     from pathlib import Path
 
@@ -97,9 +107,9 @@ def simulate(
     from digitalify.testing.tb_generator import generate_testbench
 
     ir = model if isinstance(model, IRGraph) else from_qonnx(model, name=name)
-    vhdl_files = VHDLGenerator(pipeline).generate(ir)
+    vhdl_files = VHDLGenerator(pipeline, folding).generate(ir)
     tb_filename, tb_source = generate_testbench(ir, n_vectors=n_vectors, seed=seed,
-                                                pipeline=pipeline)
+                                                backpressure=backpressure)
 
     return run_ghdl(
         vhdl_files=vhdl_files,

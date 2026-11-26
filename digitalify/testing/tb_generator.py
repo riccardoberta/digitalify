@@ -1,14 +1,20 @@
 """
-VHDL-2008 self-checking testbench generator.
+VHDL-2008 self-checking streaming testbench generator.
 
 The generated testbench:
   - instantiates ``<ir.name>_top`` as the DUT;
-  - embeds integer test vectors and the bit-exact reference outputs as
-    constants (bit-string literals, so any element width works);
-  - streams one input vector per clock (with periodic idle cycles) and,
-    every clock, checks that ``valid_o`` is high exactly when a result is
-    due ``latency`` cycles later and that ``data_o`` matches it;
-  - prints ``TB SUMMARY: X passed, Y failed`` (parsed by the GHDL runner)
+  - embeds every input beat of ``n`` test tensors and every expected output
+    beat (bit-exact reference model) as constants;
+  - a driver sends the input beats back to back; with ``backpressure`` it
+    drops ``in_valid`` on a pseudo-random pattern (never withdrawing a beat
+    that has not been accepted);
+  - a checker drives ``out_ready`` (pseudo-random with ``backpressure``),
+    compares every accepted output beat in order, and checks the protocol:
+    while ``out_valid = '1'`` and ``out_ready = '0'``, valid and data must
+    not change;
+  - a test tensor passes when all of its output beats match;
+  - prints ``TB SUMMARY: X passed, Y failed`` and ``TB STATS: cycles=...
+    first_output=...`` (parsed by the GHDL runner), fails on a timeout,
     and stops the clock so the simulation ends on its own.
 """
 
@@ -16,10 +22,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from digitalify.backend.vhdl.generator import VHDLGenerator
 from digitalify.ir.graph import IRGraph
 from digitalify.ir.types import IntType
 from digitalify.testing.reference import generate_test_vectors
+
+PATTERN_LEN = 61
 
 
 def pack_vector(values, dtype: IntType) -> str:
@@ -35,19 +42,14 @@ def pack_vector(values, dtype: IntType) -> str:
     return '"' + format(word, f"0{total}b") + '"'
 
 
-def stream_schedule(n_vectors: int, bubble_every: int = 3) -> list[int]:
-    """
-    Input schedule, one entry per clock: the vector index driven with
-    ``valid_i = '1'``, or -1 for an idle cycle (``valid_i = '0'``).  Vectors
-    go back to back with an idle cycle after every *bubble_every* of them,
-    so both full throughput and valid gating are exercised.
-    """
-    sched: list[int] = []
-    for i in range(n_vectors):
-        sched.append(i)
-        if bubble_every and i % bubble_every == bubble_every - 1 and i != n_vectors - 1:
-            sched.append(-1)
-    return sched
+def handshake_patterns(backpressure: bool, seed: int) -> tuple[str, str]:
+    """``(in_valid pattern, out_ready pattern)`` bit strings of PATTERN_LEN."""
+    if not backpressure:
+        return "1" * PATTERN_LEN, "1" * PATTERN_LEN
+    rng = np.random.default_rng(seed + 1)
+    valid = "".join("1" if v else "0" for v in rng.random(PATTERN_LEN) < 0.75)
+    ready = "".join("1" if v else "0" for v in rng.random(PATTERN_LEN) < 0.6)
+    return valid, ready
 
 
 def generate_testbench(
@@ -56,25 +58,29 @@ def generate_testbench(
     clk_period_ns: int = 10,
     seed: int = 42,
     inputs: np.ndarray | None = None,
-    pipeline=None,
+    backpressure: bool = True,
+    timeout_cycles: int | None = None,
 ) -> tuple[str, str]:
     """
-    Generate a self-checking VHDL testbench for *ir*.
+    Generate a self-checking streaming VHDL testbench for *ir*.
 
     Parameters
     ----------
     ir : IRGraph
     n_vectors : int
-        Number of test vectors (edge cases first, then random).
+        Number of test tensors (edge cases first, then random).
     clk_period_ns : int
         Clock period in nanoseconds.
     seed : int
-        RNG seed for the random vectors.
+        RNG seed for the random tensors and handshake patterns.
     inputs : np.ndarray, optional
-        Explicit integer input vectors ``(n, in_features)`` instead of
-        generated ones.
-    pipeline : bool | str | iterable of str, optional
-        Pipeline option the VHDL was generated with (sets the latency).
+        Explicit integer input tensors ``(n, in_size)`` in stream order.
+    backpressure : bool
+        Randomly throttle ``in_valid`` and ``out_ready`` (default).  With
+        False both stay high, and the cycle count measures full throughput.
+    timeout_cycles : int, optional
+        Fail if the outputs have not all arrived after this many clocks
+        (default: generous bound from the beat counts).
 
     Returns
     -------
@@ -89,43 +95,30 @@ def generate_testbench(
         expected = run_reference(ir, inputs)
     n = len(inputs)
 
-    in_bits = ir.in_features * ir.input_dtype.bits
-    out_bits = ir.out_features * ir.output_dtype.bits
-    depth = VHDLGenerator(pipeline).latency(ir)
+    in_c, out_c = ir.in_features, ir.out_features
+    in_bits = in_c * ir.input_dtype.bits
+    out_bits = out_c * ir.output_dtype.bits
+    in_beats = [pack_vector(px, ir.input_dtype) for v in inputs for px in v.reshape(-1, in_c)]
+    out_beats = [pack_vector(px, ir.output_dtype) for v in expected for px in v.reshape(-1, out_c)]
+    valid_pat, ready_pat = handshake_patterns(backpressure, seed)
+    if timeout_cycles is None:
+        timeout_cycles = 200 * (len(in_beats) + len(out_beats)) + 100_000
     top_entity = f"{ir.name}_top"
     tb_entity = f"tb_{ir.name}"
-
-    # Inputs driven before rising edge k are visible on data_o after edge
-    # k + depth - 1 (registered chain), or right away when depth == 0.
-    shift = max(depth - 1, 0)
-    sched_in = stream_schedule(n) + [-1] * shift
-    sched_out = [-1] * shift + sched_in[: len(sched_in) - shift]
-    n_cycles = len(sched_in)
 
     def array_literal(rows) -> str:
         if len(rows) == 1:
             return f"(0 => {rows[0]})"
         return "(\n        " + ",\n        ".join(rows) + "\n    )"
 
-    def int_array(values) -> str:
-        if len(values) == 1:
-            return f"(0 => {values[0]})"
-        return "(" + ", ".join(str(v) for v in values) + ")"
-
-    in_lits = [pack_vector(v, ir.input_dtype) for v in inputs]
-    out_lits = [pack_vector(v, ir.output_dtype) for v in expected]
-
     source = f"""\
 -- Self-checking streaming testbench for {top_entity}
 -- Generated by digitalify.testing.tb_generator
 --
--- Input    : {ir.in_features} x {ir.input_dtype}  ({in_bits} bits)
--- Output   : {ir.out_features} x {ir.output_dtype}  ({out_bits} bits)
--- Latency  : {depth} clock cycle(s)
--- Vectors  : {n}  (seed={seed}), one per clock with periodic idle cycles
---
--- Every clock the testbench checks that valid_o is high exactly when a
--- result is due and that data_o then equals the reference output.
+-- Input    : stream {ir.input_stream} of {ir.input_dtype}  ({in_bits}-bit beats)
+-- Output   : stream {ir.output_stream} of {ir.output_dtype}  ({out_bits}-bit beats)
+-- Tensors  : {n}  (seed={seed}), {len(in_beats)} input / {len(out_beats)} output beats
+-- Handshake: {"pseudo-random in_valid / out_ready" if backpressure else "in_valid and out_ready always high"}
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -140,25 +133,30 @@ architecture sim of {tb_entity} is
     signal   clk        : std_logic := '0';
     signal   rst        : std_logic := '1';
     signal   sim_done   : boolean   := false;
+    signal   cycle      : natural   := 0;
 
-    signal valid_i : std_logic := '0';
-    signal data_i  : std_logic_vector({in_bits - 1} downto 0) := (others => '0');
-    signal valid_o : std_logic;
-    signal data_o  : std_logic_vector({out_bits - 1} downto 0);
+    signal in_valid  : std_logic := '0';
+    signal in_ready  : std_logic;
+    signal in_data   : std_logic_vector({in_bits - 1} downto 0) := (others => '0');
+    signal out_valid : std_logic;
+    signal out_ready : std_logic := '0';
+    signal out_data  : std_logic_vector({out_bits - 1} downto 0);
 
-    constant NUM_TESTS  : integer := {n};
-    constant NUM_CYCLES : integer := {n_cycles};
-    type input_array_t  is array(0 to NUM_TESTS - 1) of std_logic_vector({in_bits - 1} downto 0);
-    type output_array_t is array(0 to NUM_TESTS - 1) of std_logic_vector({out_bits - 1} downto 0);
-    type sched_t        is array(0 to NUM_CYCLES - 1) of integer;
+    constant NUM_TESTS  : natural := {n};
+    constant IN_BEATS   : natural := {len(in_beats)};
+    constant OUT_BEATS  : natural := {len(out_beats)};
+    constant OUT_PER_T  : natural := {len(out_beats) // n};
+    constant TIMEOUT    : natural := {timeout_cycles};
+    constant PAT_LEN    : natural := {PATTERN_LEN};
+    constant VALID_PAT  : std_logic_vector(0 to PAT_LEN - 1) := "{valid_pat}";
+    constant READY_PAT  : std_logic_vector(0 to PAT_LEN - 1) := "{ready_pat}";
 
-    constant TEST_INPUTS : input_array_t := {array_literal(in_lits)};
+    type in_array_t  is array(0 to IN_BEATS - 1) of std_logic_vector({in_bits - 1} downto 0);
+    type out_array_t is array(0 to OUT_BEATS - 1) of std_logic_vector({out_bits - 1} downto 0);
 
-    constant EXPECTED_OUTPUTS : output_array_t := {array_literal(out_lits)};
+    constant INPUTS : in_array_t := {array_literal(in_beats)};
 
-    -- Vector driven in each cycle / vector whose result is due (-1: none)
-    constant SCHED_IN  : sched_t := {int_array(sched_in)};
-    constant SCHED_OUT : sched_t := {int_array(sched_out)};
+    constant EXPECTED : out_array_t := {array_literal(out_beats)};
 
 begin
 
@@ -166,69 +164,129 @@ begin
 
     dut : entity work.{top_entity}
         port map (
-            clk     => clk,
-            rst     => rst,
-            valid_i => valid_i,
-            data_i  => data_i,
-            valid_o => valid_o,
-            data_o  => data_o
+            clk       => clk,
+            rst       => rst,
+            in_valid  => in_valid,
+            in_ready  => in_ready,
+            in_data   => in_data,
+            out_valid => out_valid,
+            out_ready => out_ready,
+            out_data  => out_data
         );
 
-    stim : process
-        variable n_pass : integer := 0;
-        variable n_fail : integer := 0;
-        variable idx    : integer;
+    reset : process
     begin
         rst <= '1';
         wait until rising_edge(clk);
         wait until rising_edge(clk);
         rst <= '0';
-        wait until rising_edge(clk);
-        wait for 1 ns;
+        wait;
+    end process reset;
 
-        for k in 0 to NUM_CYCLES - 1 loop
-            if SCHED_IN(k) >= 0 then
-                data_i  <= TEST_INPUTS(SCHED_IN(k));
-                valid_i <= '1';
+    count : process(clk)
+    begin
+        if rising_edge(clk) then
+            if rst = '1' then cycle <= 0; else cycle <= cycle + 1; end if;
+        end if;
+    end process count;
+
+    -- Input driver: a beat, once valid, is held until accepted
+    driver : process(clk)
+        variable idx : natural := 0;
+    begin
+        if rising_edge(clk) then
+            if rst = '1' then
+                in_valid <= '0';
+                idx := 0;
             else
-                data_i  <= (others => '0');
-                valid_i <= '0';
-            end if;
-{"" if depth else "            wait for 1 ns;" + chr(10)}{"            wait until rising_edge(clk);" + chr(10) + "            wait for 1 ns;" + chr(10) if depth else ""}
-            idx := SCHED_OUT(k);
-            if idx >= 0 then
-                if valid_o = '1' and data_o = EXPECTED_OUTPUTS(idx) then
-                    report "Test " & integer'image(idx) & ": PASSED" severity note;
-                    n_pass := n_pass + 1;
+                if in_valid = '1' and in_ready = '1' then
+                    idx := idx + 1;
+                end if;
+                if in_valid = '1' and in_ready = '0' then
+                    null;                                   -- hold the pending beat
+                elsif idx < IN_BEATS and VALID_PAT(cycle mod PAT_LEN) = '1' then
+                    in_valid <= '1';
+                    in_data  <= INPUTS(idx);
                 else
-                    report "Test " & integer'image(idx)
-                        & ": FAILED  valid=" & std_logic'image(valid_o)
-                        & "  got=" & to_hstring(data_o)
-                        & "  expected=" & to_hstring(EXPECTED_OUTPUTS(idx))
+                    in_valid <= '0';
+                end if;
+            end if;
+        end if;
+    end process driver;
+
+    -- Output checker
+    checker : process(clk)
+        variable oidx       : natural := 0;
+        variable n_pass     : natural := 0;
+        variable n_fail     : natural := 0;
+        variable tensor_ok  : boolean := true;
+        variable first_out  : integer := -1;
+        variable stalled    : boolean := false;
+        variable held_data  : std_logic_vector({out_bits - 1} downto 0);
+        variable finished   : boolean := false;
+    begin
+        if rising_edge(clk) and not finished then
+            if rst = '1' then
+                out_ready <= '0';
+            else
+                -- protocol: a stalled beat must stay valid and unchanged
+                if stalled and (out_valid /= '1' or out_data /= held_data) then
+                    report "Cycle " & integer'image(cycle)
+                        & ": FAILED  output changed while stalled (valid/data not held)"
                         severity error;
                     n_fail := n_fail + 1;
                 end if;
-            elsif valid_o /= '0' then
-                report "Cycle " & integer'image(k) & ": FAILED  valid_o high with no result due"
-                    severity error;
-                n_fail := n_fail + 1;
+                stalled := false;
+
+                if out_valid = '1' and out_ready = '1' then
+                    if first_out < 0 then first_out := cycle; end if;
+                    if out_data /= EXPECTED(oidx) then
+                        report "Beat " & integer'image(oidx) & " (test "
+                            & integer'image(oidx / OUT_PER_T) & "): MISMATCH  got="
+                            & to_hstring(out_data) & "  expected=" & to_hstring(EXPECTED(oidx))
+                            severity error;
+                        tensor_ok := false;
+                    end if;
+                    if oidx mod OUT_PER_T = OUT_PER_T - 1 then
+                        if tensor_ok then
+                            report "Test " & integer'image(oidx / OUT_PER_T) & ": PASSED" severity note;
+                            n_pass := n_pass + 1;
+                        else
+                            report "Test " & integer'image(oidx / OUT_PER_T) & ": FAILED" severity error;
+                            n_fail := n_fail + 1;
+                        end if;
+                        tensor_ok := true;
+                    end if;
+                    oidx := oidx + 1;
+                elsif out_valid = '1' then
+                    stalled   := true;
+                    held_data := out_data;
+                end if;
+
+                if oidx = OUT_BEATS or cycle >= TIMEOUT then
+                    if oidx < OUT_BEATS then
+                        report "TIMEOUT: " & integer'image(oidx) & " of "
+                            & integer'image(OUT_BEATS) & " output beats received" severity error;
+                        n_fail := n_fail + (NUM_TESTS - n_pass - n_fail);
+                    end if;
+                    report "TB STATS: cycles=" & integer'image(cycle)
+                        & " first_output=" & integer'image(first_out) severity note;
+                    report "TB SUMMARY: " & integer'image(n_pass) & " passed, "
+                        & integer'image(n_fail) & " failed out of "
+                        & integer'image(NUM_TESTS) & " tests" severity note;
+                    finished := true;
+                    sim_done <= true;
+                    if n_fail = 0 and n_pass = NUM_TESTS then
+                        report "TB: ALL TESTS PASSED" severity note;
+                    else
+                        report "TB: TESTS FAILED" severity failure;
+                    end if;
+                end if;
+
+                out_ready <= READY_PAT((cycle + 17) mod PAT_LEN);
             end if;
-{"            wait until rising_edge(clk);" + chr(10) + "            wait for 1 ns;" + chr(10) if not depth else ""}        end loop;
-
-        report "TB SUMMARY: " & integer'image(n_pass) & " passed, "
-            & integer'image(n_fail) & " failed out of "
-            & integer'image(NUM_TESTS) & " tests"
-            severity note;
-
-        if n_fail = 0 and n_pass = NUM_TESTS then
-            report "TB: ALL TESTS PASSED" severity note;
-        else
-            report "TB: TESTS FAILED" severity failure;
         end if;
-
-        sim_done <= true;
-        wait;
-    end process stim;
+    end process checker;
 
 end architecture sim;
 """
