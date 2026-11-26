@@ -105,18 +105,20 @@ vhdl_out/
 └── mlp_top.vhd        # clk, rst, valid_i, data_i -> valid_o, data_o
 ```
 
-Bus packing: element `i` of a bus with `B`-bit elements is `data((i+1)*B-1 downto i*B)`. A `valid` bit travels with the data; latency is 1 clock per `linear` layer.
+Bus packing: element `i` of a bus with `B`-bit elements is `data((i+1)*B-1 downto i*B)`. A `valid` bit travels with the data; latency is 1 clock per `linear` layer (more with pipelining, below), and a new input vector can be accepted every clock.
 
 The linear component, in outline:
 
 ```vhdl
--- Combinational MAC at the exact width the weights need
+-- Combinational MAC at the exact width the weights need:
+-- products, then a balanced adder tree (depth ceil(log2(IN_F)))
 for j in 0 to OUT_F - 1 loop
-    s := (others => '0');
     for i in 0 to IN_F - 1 loop
-        s := s + resize(x(i) * WEIGHTS(j)(i), SUM_W);
+        t(i) := resize(x(i) * WEIGHTS(j)(i), SUM_W);
     end loop;
-    acc(j) <= shift_left(resize(s, ACC_W), F) + BIASES(j);
+    for k in 0 to 7 loop t(k) := t(2 * k) + t(2 * k + 1); end loop;   -- 16 -> 8
+    ...                                                               -- 8 -> 4 -> 2 -> 1
+    acc(j) <= shift_left(resize(t(0), ACC_W), F) + BIASES(j);
 end loop;
 
 -- Output register: ReLU, then q = clip(round(acc * MULT / 2^SHIFT))
@@ -126,20 +128,51 @@ r := p and SHIFT_MASK(j);                 -- discarded bits drive the rounding
 if r > half or (r = half and q(0) = '1') then q := q + 1; end if;   -- ROUND
 ```
 
+### Pipelining
+
+`convert(..., pipeline=...)` (also `simulate` and `VHDLGenerator(pipeline=...)`) adds optional registers inside every linear layer:
+
+```
+products -[products]- tree level 1 -[tree]- level 2 -[tree]- ... last level
+    -> +bias -[acc]- ReLU -> x MULT -[mult]- round/clip -[out]-
+```
+
+| Stage | Register | Extra latency per layer |
+|---|---|---|
+| `"products"` | after the products x·w | 1 |
+| `"tree"` / `"tree:K"` | inside the adder tree, every level / every K levels (never after the last level) | ⌈depth / K⌉ − 1, depth = ⌈log2(IN_F)⌉ |
+| `"acc"` | after the last tree level + bias | 1 |
+| `"mult"` | after the requantisation product (layers that requantise) | 1 |
+
+`pipeline` takes a stage name, a list of names, or `True` for every stage with the tree registered at every level; the default (`None`) adds nothing, leaving one register per layer. Each register adds one clock of latency; throughput stays one vector per clock.
+
+Measured on the 16→8→4 example (4-bit weights; Artix-7 xc7a200t, out-of-context, post-synthesis estimates):
+
+| `pipeline` | Latency (cycles) | fmax | FFs | LUTs |
+|---|---|---|---|---|
+| `None` | 2 | 55 MHz | 82 | 1 522 |
+| `["acc", "mult"]` | 6 | 62 MHz | 366 | 1 595 |
+| `["tree:2", "acc"]` | 6 | 149 MHz | 682 | 1 546 |
+| `["tree", "acc"]` | 9 | 230 MHz | 1 575 | 1 632 |
+| `["products", "tree", "acc"]` | 11 | 258 MHz | 2 125 | 1 704 |
+| `True` | 13 | 262 MHz | 2 263 | 1 744 |
+
+The MAC (products, adder tree, bias) is the long path; once it is cut, the remaining limit is the ReLU + requantisation + rounding stage.
+
 ## Testing
 
 ```bash
 pytest tests          # GHDL tests are skipped if GHDL is not found
 ```
 
-The suite checks the rounding arithmetic, the importer's error handling and, for a matrix of models (mixed precision, odd widths, unsigned input, float bias, Gemm, per-channel and non-power-of-two scales, every rounding mode, ...), both `verify` (reference vs QONNX) and `simulate` (VHDL vs reference).
+The suite checks the rounding arithmetic, the importer's error handling and, for a matrix of models (mixed precision, odd widths, unsigned input, float bias, Gemm, per-channel and non-power-of-two scales, every rounding mode, ...), both `verify` (reference vs QONNX) and `simulate` (VHDL vs reference), the latter with and without pipelining. The generated testbench streams one vector per clock with periodic idle cycles and checks every clock that `valid_o` is high exactly when a result is due, so a wrong latency or a misaligned `valid` fails the test.
 
 ## Extending the library
 
 Adding an operator takes four steps:
 
 1. **Frontend** — map the QONNX pattern to an `IRNode` in `digitalify/frontend/qonnx_importer.py`.
-2. **Hardware** — subclass `VHDLOperator` (`digitalify/operators/`) and implement `architecture(node, entity)`; set `latency` and `clocked`.
+2. **Hardware** — subclass `VHDLOperator` (`digitalify/operators/`) and implement `architecture(node, entity)`; set `latency` and `clocked` (override `node_latency(node)` if the latency depends on the node or on the `pipeline` option).
 3. **Register** it in `digitalify/operators/registry.py`.
 4. **Reference** — add its bit-exact model to `digitalify/testing/reference.py`, then a variant to `tests/test_end_to_end.py`.
 

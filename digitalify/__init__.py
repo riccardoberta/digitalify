@@ -27,7 +27,8 @@ from digitalify.ir import IntType, IRGraph, IRNode
 from digitalify.verify import VerificationResult, verify
 
 
-def convert(model, output_dir: str | None = None, name: str | None = None) -> dict[str, str]:
+def convert(model, output_dir: str | None = None, name: str | None = None,
+            pipeline=None) -> dict[str, str]:
     """
     High-level entry point: QONNX → IR → VHDL.
 
@@ -39,6 +40,13 @@ def convert(model, output_dir: str | None = None, name: str | None = None) -> di
         If given, the VHDL files are also written to this directory.
     name : str or None
         Prefix for the VHDL entities (defaults to the ONNX graph name).
+    pipeline : bool | str | iterable of str, optional
+        Extra registers inside every linear layer: ``"products"`` (after
+        the products), ``"tree"`` / ``"tree:K"`` (inside the adder tree,
+        every level / every K levels), ``"acc"`` (after the adder tree +
+        bias), ``"mult"`` (after the requantisation product); ``True`` for
+        all of them.  Default: none (one register per layer).  Each
+        register adds one clock of latency and shortens the critical path.
 
     Returns
     -------
@@ -46,7 +54,7 @@ def convert(model, output_dir: str | None = None, name: str | None = None) -> di
         ``{filename: vhdl_source}``; the top level is ``<name>_top.vhd``.
     """
     ir = model if isinstance(model, IRGraph) else from_qonnx(model, name=name)
-    files = VHDLGenerator().generate(ir)
+    files = VHDLGenerator(pipeline).generate(ir)
 
     if output_dir is not None:
         import os
@@ -66,14 +74,16 @@ def simulate(
     keep_work_dir: bool = False,
     vcd: bool = False,
     name: str | None = None,
+    pipeline=None,
 ):
     """
     QONNX → VHDL → self-checking testbench → GHDL simulation.
 
     The testbench compares the VHDL against the bit-exact integer reference
     model; use :func:`verify` to compare that reference with the original
-    QONNX model.  Requires GHDL ≥ 3.0 (on PATH, in ``DIGITALIFY_GHDL``, or
-    passed as ``ghdl_path``).
+    QONNX model.  ``pipeline`` has the same meaning as in :func:`convert`.
+    Requires GHDL ≥ 3.0 (on PATH, in ``DIGITALIFY_GHDL``, or passed as
+    ``ghdl_path``).
 
     Returns
     -------
@@ -87,8 +97,9 @@ def simulate(
     from digitalify.testing.tb_generator import generate_testbench
 
     ir = model if isinstance(model, IRGraph) else from_qonnx(model, name=name)
-    vhdl_files = VHDLGenerator().generate(ir)
-    tb_filename, tb_source = generate_testbench(ir, n_vectors=n_vectors, seed=seed)
+    vhdl_files = VHDLGenerator(pipeline).generate(ir)
+    tb_filename, tb_source = generate_testbench(ir, n_vectors=n_vectors, seed=seed,
+                                                pipeline=pipeline)
 
     return run_ghdl(
         vhdl_files=vhdl_files,

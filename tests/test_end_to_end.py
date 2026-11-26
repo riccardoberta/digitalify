@@ -56,6 +56,20 @@ def test_vhdl_matches_reference(variant, ghdl):
     assert result.n_passed == 12
 
 
+@pytest.mark.parametrize("variant", sorted(VARIANTS))
+def test_pipelined_vhdl_matches_reference(variant, ghdl):
+    result = digitalify.simulate(_model(variant), n_vectors=12, ghdl_path=ghdl, pipeline=True)
+    assert result.passed, result.summary() + "\n" + result.log[-2000:]
+    assert result.n_passed == 12
+
+
+@pytest.mark.parametrize("pipeline", ["acc", "mult", "products", "tree", ("tree:2", "acc")])
+@pytest.mark.parametrize("variant", ["default", "raw_output", "single_features"])
+def test_single_pipeline_stage(variant, pipeline, ghdl):
+    result = digitalify.simulate(_model(variant), n_vectors=12, ghdl_path=ghdl, pipeline=pipeline)
+    assert result.passed, result.summary() + "\n" + result.log[-2000:]
+
+
 def test_standalone_relu(relu_first_model, ghdl):
     ir = digitalify.from_qonnx(relu_first_model)
     assert [n.op_type for n in ir.nodes] == ["relu", "linear"]

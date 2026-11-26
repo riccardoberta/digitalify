@@ -16,8 +16,69 @@ occupies ``data((i+1)*B-1 downto i*B)``.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 from digitalify.ir.node import IRNode
+
+#: Optional pipeline registers inside a ``linear`` layer, in data-flow order:
+#:   "products" — after the products x·w (before the adder tree)
+#:   "tree"     — inside the adder tree, every ``tree_every`` levels
+#:                ("tree:2" = every 2 levels; plain "tree" = every level)
+#:   "acc"      — after the adder tree + bias (before ReLU / requantisation)
+#:   "mult"     — after the requantisation product ``acc · MULT`` (before rounding)
+PIPELINE_STAGES = ("products", "tree", "acc", "mult")
+
+
+@dataclass(frozen=True)
+class Pipeline:
+    """Normalised ``pipeline`` option (see :func:`normalize_pipeline`)."""
+
+    stages: frozenset = frozenset()
+    tree_every: int = 1
+
+    def __contains__(self, stage: str) -> bool:
+        return stage in self.stages
+
+    def __bool__(self) -> bool:
+        return bool(self.stages)
+
+    def describe(self) -> str:
+        names = []
+        for st in PIPELINE_STAGES:
+            if st in self.stages:
+                names.append(f"tree:{self.tree_every}" if st == "tree" else st)
+        return ", ".join(names)
+
+
+def normalize_pipeline(pipeline) -> Pipeline:
+    """
+    ``None`` / ``False`` → no extra registers; ``True`` → every stage, the
+    adder tree registered at every level; a stage name or an iterable of
+    names (``"tree:K"`` for a register every K tree levels) → those stages.
+    """
+    if isinstance(pipeline, Pipeline):
+        return pipeline
+    if pipeline is None or pipeline is False:
+        return Pipeline()
+    if pipeline is True:
+        return Pipeline(frozenset(PIPELINE_STAGES), 1)
+    items = [pipeline] if isinstance(pipeline, str) else list(pipeline)
+    stages, tree_every, unknown = set(), 1, []
+    for item in items:
+        name, _, arg = str(item).partition(":")
+        if name not in PIPELINE_STAGES or (arg and name != "tree"):
+            unknown.append(item)
+            continue
+        if arg:
+            if not arg.isdigit() or int(arg) < 1:
+                raise ValueError(f"'{item}': the tree interval must be a positive integer.")
+            tree_every = int(arg)
+        stages.add(name)
+    if unknown:
+        raise ValueError(f"Unknown pipeline stage(s) {unknown}; valid stages are "
+                         f"{list(PIPELINE_STAGES)} ('tree:K' for every K tree levels).")
+    return Pipeline(frozenset(stages), tree_every)
 
 
 class VHDLOperator(ABC):
@@ -28,6 +89,13 @@ class VHDLOperator(ABC):
 
     #: Whether the component has clk / rst ports.
     clocked: bool = False
+
+    def __init__(self, pipeline: bool | str | Iterable[str] | None = None):
+        self.pipeline = normalize_pipeline(pipeline)
+
+    def node_latency(self, node: IRNode) -> int:
+        """Clock cycles from valid_i to valid_o for this node."""
+        return self.latency
 
     @abstractmethod
     def architecture(self, node: IRNode, entity: str) -> str:
