@@ -152,7 +152,7 @@ Vivado 2025.1 out-of-context synthesis, Artix-7 XC7A200T, `pipeline=True`, 784 c
 | fully parallel | multiplier (`thresholds=False`) | 55,139 | 77,920 | 136 | 83 MHz | 3.5 W | 106 k |
 | fully parallel | thresholds on the 4-bit layers (`"auto"`, default) | 53,895 | 77,386 | 40 | 88 MHz | 1.6 W | 112 k |
 | fully parallel | thresholds everywhere (`True`) | 76,206 | 79,622 | 0 | 83 MHz | 3.9 W | 106 k |
-| folded `linear_1` (16, 24), `linear_2` (2, 40) | `"auto"` | 17,883 | 13,404 | 8 | 18 MHz | 0.8 W | 23 k |
+| folded `linear_1` (16, 24), `linear_2` (2, 40) | `"auto"` | 18,359 | 23,450 | 8 | 98 MHz | 0.9 W | 125 k |
 
 All configurations use 1.5 BRAM (the line buffers).
 
@@ -163,8 +163,11 @@ All configurations use 1.5 BRAM (the line buffers).
 * `thresholds=True` also turns that layer into 255 thresholds per output.
   This removes every DSP but costs 22 k LUTs, so for 8-bit outputs the
   multiplier is the better choice.
-* Folded, the critical path is the folded `linear` stage, which is not pipelined
-  yet: ROM → 40 multipliers → adder tree → accumulator.
+* Folded, the design needs a third of the LUTs and 8 DSPs, and it is faster
+  than the fully parallel one.  The critical path is the same final 8-bit
+  requantisation (rounding and clipping after the product register, 10 ns).
+  Before the folded unit was pipelined, it ran at 18 MHz: ROM → 40 multipliers →
+  adder tree → accumulator in one clock.
 
 ## Generated hardware
 
@@ -196,7 +199,7 @@ vhdl_out/
 
 | Stage | Function | Rate |
 |---|---|---|
-| `linear` | `requant(relu(W·x + b))` on every beat | 1 beat/clock; folded: 1 beat per `(out/PE)·(in/SIMD) + 1` clocks |
+| `linear` | `requant(relu(W·x + b))` on every beat | 1 beat/clock; folded: 1 beat per `(out/PE)·(in/SIMD)` clocks |
 | `pad` | border pixels of a constant value | emits `Hp·Wp` beats per `H·W` |
 | `swg` | `KH-1` line buffers + window registers → one `KH·KW·C` window per output position | 1 pixel/clock |
 | `pool` | per-channel max / sum over a window | 1/clock |
@@ -221,12 +224,13 @@ files = digitalify.convert(model, folding={"linear_0": (2, 3), "linear_1": (4, 8
 | Fully parallel | 49 249 | 8 738 | 5.5 | 13 MHz | 2.79 W |
 | Fully parallel, `pipeline=True` | 59 799 | 74 514 | 5.5 | 132 MHz | 4.73 W |
 | Folded (`linear_0` 2×3, `linear_1`/`linear_2` 4×8, `linear_3` 2×4) | 8 172 | 11 231 | 5.5 | 55 MHz | 0.52 W |
+| Folded, same, `pipeline=True` | 7 838 | 13 820 | 5.5 | 132 MHz | 0.52 W |
 
-The line buffers map to block RAM. With full pipelining the critical path moves to the max-pool stage (a sequential compare over the window), which a comparison tree would shorten. In the folded unit the critical path runs from the weight-ROM address through the multiplier and the SIMD adder tree into the accumulator; registering the ROM output is the next improvement.
+The line buffers map to block RAM. With full pipelining the critical path moves to the max-pool stage (a sequential compare over the window), which a comparison tree would shorten. Unpipelined, the folded unit's critical path runs from the weight-ROM address through the multipliers and the SIMD adder tree into the accumulator.  With `pipeline=True` the folded design reaches the same clock as the fully parallel one, with 13 % of its LUTs.  A folded unit takes `(out/PE)·(in/SIMD)` clocks per beat: the next beat is accepted while the last work item of the current one is issued.
 
 ### Pipelining
 
-`convert(..., pipeline=...)` (also `simulate` and `VHDLGenerator(pipeline=...)`) adds optional registers inside every fully parallel linear stage:
+`convert(..., pipeline=...)` (also `simulate` and `VHDLGenerator(pipeline=...)`) adds optional registers inside every linear stage:
 
 ```
 products -[products]- tree level 1 -[tree]- level 2 -[tree]- ... last level
@@ -240,7 +244,14 @@ products -[products]- tree level 1 -[tree]- level 2 -[tree]- ... last level
 | `"acc"` | after the last tree level + bias | 1 |
 | `"mult"` | after the requantisation product, or the threshold comparisons (layers that requantise) | 1 |
 
-`pipeline` takes a stage name, a list of names, or `True` for every stage with the tree registered at every level; the default (`None`) adds nothing. Each register adds one clock of latency; throughput stays one beat per clock.
+`pipeline` takes a stage name, a list of names, or `True` for every stage with the tree registered at every level; the default (`None`) adds nothing. Each register adds one clock of latency; throughput does not change.
+
+Folded stages get the same registers on their datapath (the tree is the `SIMD`-input tree, and the accumulator sits between the tree and `"acc"`). In folded stages `"products"` also registers the weight-ROM word with its input slice, so it adds 2 clocks:
+
+```
+weight ROM -[products]- products -[products]- SIMD adder tree -[tree]-
+    -> accumulate -> +bias -[acc]- ReLU -> x MULT -[mult]- round/clip
+```
 
 Measured on the 16→8→4 MLP (4-bit weights; Artix-7 xc7a200t, out-of-context, post-synthesis estimates, before the streaming interface was added):
 

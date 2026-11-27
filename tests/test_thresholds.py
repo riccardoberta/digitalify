@@ -89,6 +89,8 @@ def test_threshold_accumulator_has_no_fractional_bits():
     ("mult", None),
     (None, {"linear_0": (2, 9), "linear_1": (3, 4), "linear_2": (5, 2)}),
     (None, {"linear_0": (1, 27), "linear_2": (1, 1)}),
+    (True, {"linear_0": (2, 9), "linear_1": (3, 4), "linear_2": (5, 2)}),
+    ("mult", {"linear_0": (4, 3), "linear_2": (1, 24)}),
 ])
 def test_threshold_vhdl_matches_reference(pipeline, folding, ghdl):
     ir = digitalify.from_qonnx(_bn_cnn(), thresholds=True)

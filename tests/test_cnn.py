@@ -110,13 +110,34 @@ def test_folded_mlp(folding, ghdl):
     assert result.passed, result.summary() + "\n" + result.log[-3000:]
 
 
+@pytest.mark.parametrize("pipeline", [True, "products", "tree:2", ["acc", "mult"], ["products", "tree"]])
+@pytest.mark.parametrize("folding", [
+    {"linear_0": (2, 9), "linear_1": (3, 4), "linear_2": (5, 2)},
+    {"linear_0": (4, 1), "linear_1": (1, 1), "linear_2": (1, 6)},
+])
+def test_pipelined_folded_cnn(pipeline, folding, ghdl):
+    result = digitalify.simulate(_model("conv_pool_linear"), n_vectors=3, ghdl_path=ghdl,
+                                 folding=folding, pipeline=pipeline)
+    assert result.passed, result.summary() + "\n" + result.log[-3000:]
+
+
+@pytest.mark.parametrize("pipeline", [None, True])
+def test_folded_mlp_issues_one_work_item_per_clock(pipeline, ghdl):
+    """No bubble between beats: NF·SF clocks per beat, pipelined or not."""
+    model = make_mlp([16, 8, 4], seed=5)
+    runs = [digitalify.simulate(model, n_vectors=n, ghdl_path=ghdl, backpressure=False,
+                                folding={"linear_0": (2, 4)}, pipeline=pipeline) for n in (4, 8)]
+    assert all(r.passed for r in runs)
+    assert runs[1].cycles - runs[0].cycles == 4 * (8 // 2) * (16 // 4)
+
+
 def test_folding_trades_cycles_for_multipliers(ghdl):
     model = make_mlp([16, 8, 4], seed=5)
     full = digitalify.simulate(model, n_vectors=8, ghdl_path=ghdl, backpressure=False)
     folded = digitalify.simulate(model, n_vectors=8, ghdl_path=ghdl, backpressure=False,
                                  folding={"linear_0": (2, 4)})
     assert full.passed and folded.passed
-    # 8 vectors: one per clock fully parallel, (8/2)·(16/4) + 1 = 17 clocks folded
+    # 8 vectors: one per clock fully parallel, (8/2)·(16/4) = 16 clocks folded
     assert folded.cycles > full.cycles + 8 * 15
     files = digitalify.convert(model, folding={"linear_0": (2, 4)})
     assert "PE=2, SIMD=4, 16 clocks per beat, 8 multipliers" in files["mlp_top.vhd"]

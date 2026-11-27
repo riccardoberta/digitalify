@@ -86,7 +86,7 @@ every stage simple and testable on its own.
 
 | Stage | Function | Rate |
 |---|---|---|
-| `linear` | `y = requant(relu(W·x + b))` per beat (matrix-vector unit) | 1 beat/clock when fully parallel; folded: 1 beat per `NF·SF + 1` clocks |
+| `linear` | `y = requant(relu(W·x + b))` per beat (matrix-vector unit) | 1 beat/clock when fully parallel; folded: 1 beat per `NF·SF` clocks |
 | `relu` | `max(0, x)` per element | 1/clock |
 | `pad` | inserts border pixels with a constant value | emits `Hp·Wp` beats per `H·W` input beats |
 | `swg` | sliding window generator: line buffers + window registers; emits a `KH·KW·C` window beat per output position (stride applied) | 1 input beat/clock |
@@ -150,12 +150,21 @@ with the `pipeline` options).  Otherwise the unit is folded:
 
 * It needs `PE·SIMD` multipliers and takes `NF·SF` clocks per beat, where
   `NF = out/PE` and `SF = in/SIMD`.
-* The input vector is latched and rotated by `SIMD` elements per clock.
+* The input vector is latched and rotated by `SIMD` elements per clock.  The
+  next beat is latched while the last work item of the current one issues, so
+  there is no bubble between beats.
 * The weights live in a constant ROM indexed by the fold counters.  Synthesis
   maps it to LUTs or block RAM.
 * `PE` accumulators sum over `SF` clocks.  A finalisation register then adds
   the bias, applies ReLU and requantises `PE` neurons per clock into the output
   vector, and the output beat goes out after the last neuron group.
+* The datapath is a pipeline of work items (`PE` neurons × `SIMD` inputs).
+  Each item carries tags through the registers: valid, first / last synapse
+  fold, neuron fold.  The `pipeline` option places registers as in the fully
+  parallel unit: weight-ROM word and products (`products`), SIMD adder tree
+  (`tree`), after bias (`acc`), after the requantisation product or threshold
+  comparisons (`mult`).  On the MNIST example this takes the folded design
+  from 18 to 98 MHz.
 
 The user passes `folding={"linear_0": (PE, SIMD), ...}` to `convert` /
 `simulate`.  Layers not listed stay fully parallel.  A helper that chooses
@@ -211,12 +220,9 @@ digitalify/
 * Block-RAM line buffers with synchronous read, for large images (the first
   version uses distributed RAM with asynchronous read).
 * Automatic folding for a target throughput or resource budget.
-* Overlapping input and computation in folded `linear` (removes the one-clock
-  bubble per beat).
-* Registering the weight-ROM output and the products in folded `linear`.  The
-  first Vivado runs put its critical path there: ROM address → multiplier →
-  SIMD adder tree → accumulator, about 18 ns (55 ns with SIMD = 40 on the
-  MNIST example).
+* Splitting the requantisation of wide outputs (8-bit, 31-bit accumulator)
+  into more stages: after the folded unit was pipelined, rounding and clipping
+  after the product register limit the MNIST example to about 98 MHz.
 * A comparison / adder tree in `pool`.  With fully pipelined linear stages the
   sequential max over the window becomes the critical path (7.5 ns on Artix-7).
 * Padding inside the window generator.  A separate `pad` stage emits

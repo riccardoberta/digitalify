@@ -52,6 +52,8 @@ def convert(model, output_dir: str | None = None, name: str | None = None,
         ``{linear_stage_name: (PE, SIMD)}``: compute that stage with
         ``PE·SIMD`` multipliers over ``(out/PE)·(in/SIMD)`` clocks per beat
         instead of fully in parallel.  Stage names are in ``ir.summary()``.
+        ``pipeline`` applies to folded stages too (``"products"`` also
+        registers the weight-ROM output).
 
     Returns
     -------
