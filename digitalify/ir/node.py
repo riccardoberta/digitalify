@@ -51,6 +51,11 @@ class IRNode:
           - ``relu``    : bool — apply max(0, ·) to the accumulator
           - ``requant`` : dict or None (see ``requant`` below, per output
             channel).  When None the accumulator itself is the output.
+          - ``thresholds`` : optional int64 array ``(out_features, N)``, with
+            ``threshold_base`` (int64 ``(out_features,)``) and ``rounding``:
+            threshold activation replacing bias, ReLU and requantisation
+            (``bias`` is then 0, ``relu`` False and ``requant`` None):
+            ``out[j] = threshold_base[j] + #{k : acc[j] >= thresholds[j][k]}``.
 
         ``relu``: no attributes.
 

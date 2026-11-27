@@ -37,6 +37,16 @@ q_y[j] = clip( round( acc[j] · MULT[j] / 2^SHIFT[j] ) )        MULT/2^SHIFT = s
 * Every float32 scale is a dyadic rational, so with power-of-two scales (the usual choice in Brevitas, QKeras, hls4ml) `MULT / 2^SHIFT` is **exact**. Arbitrary scales use a 32-bit fixed-point multiplier (`max_mult_bits`).
 * Float (unquantised) biases — Brevitas' default — and folded BatchNorm offsets get `F` fractional accumulator bits (`max_bias_frac_bits`, default 16) instead of being rounded away.
 * All seven QONNX rounding modes are implemented in hardware: `ROUND` (half-even), `HALF_UP`, `HALF_DOWN`, `FLOOR`, `CEIL`, `UP`, `DOWN`.
+
+**Threshold activations.** The output quantiser is monotone in `acc`.  So for a `B`-bit output, bias + [ReLU] + `Quant` can instead be `2^B − 1` integer thresholds per channel:
+
+```
+q_y[j] = BASE[j] + #{k : Σ_i q_w[j,i]·q_x[i]  ≥  T[j][k]}
+```
+
+* The thresholds are computed with exact rational arithmetic from the float32 parameters, for any rounding mode.  So the result is exact for **any** scale and bias, including non-power-of-two scales and folded BatchNorm.
+* There is no multiplier and no fractional bias bits.  The hardware is one comparator per threshold, plus a binary search over the resulting thermometer code.
+* `from_qonnx(model, thresholds="auto")` (the default) uses them when the multiplier form would be approximate and the output has at most 4 bits.  `thresholds=True` uses them for outputs of up to 8 bits; `False` never uses them.
 * Accumulator widths come from interval analysis of the actual weights and input range, so they never overflow and are no wider than needed.
 
 ## Supported patterns
@@ -113,6 +123,49 @@ cnn = make_cnn((3, 32, 32), [
 
 See `examples/simple_network.ipynb` for a full walkthrough.
 
+### A real model: MNIST CNN from Brevitas
+
+`examples/mnist` trains a small Brevitas CNN and runs it through the whole flow:
+8-bit input, two 3×3 convolutions with BatchNorm, 4-bit ReLU and max pooling,
+then a 400 → 10 linear layer.
+
+```bash
+pip install -e ".[examples]"
+python examples/mnist/train_brevitas.py    # ~1 min on a CPU, writes mnist_cnn.onnx
+python examples/mnist/run_mnist.py
+```
+
+```
+integer model accuracy: 0.9843 on 10000 test images      (Brevitas: 0.9843)
+integer model vs QONNX: [PASSED]  200/200 vectors match QONNX
+VHDL vs integer model:  [PASSED]  10 passed, 0 failed
+throughput: 784 clocks per image, latency 746 clocks
+```
+
+`ir.quantize_input(images)` applies the network's input `Quant` to real-valued
+images.  `verify` and `simulate` accept the result as `inputs=`.
+
+Vivado 2025.1 out-of-context synthesis, Artix-7 XC7A200T, `pipeline=True`, 784 clocks per image:
+
+| Configuration | Activation | LUT | FF | DSP | fmax | Power | Images/s |
+|---|---|---|---|---|---|---|---|
+| fully parallel | multiplier (`thresholds=False`) | 55,139 | 77,920 | 136 | 83 MHz | 3.5 W | 106 k |
+| fully parallel | thresholds on the 4-bit layers (`"auto"`, default) | 53,895 | 77,386 | 40 | 88 MHz | 1.6 W | 112 k |
+| fully parallel | thresholds everywhere (`True`) | 76,206 | 79,622 | 0 | 83 MHz | 3.9 W | 106 k |
+| folded `linear_1` (16, 24), `linear_2` (2, 40) | `"auto"` | 17,883 | 13,404 | 8 | 18 MHz | 0.8 W | 23 k |
+
+All configurations use 1.5 BRAM (the line buffers).
+
+* With the default thresholds, the two BatchNorm layers need no multiplier at
+  all.  96 DSPs go away, power halves, and the requantisation is exact.
+* Fully parallel with `"auto"`, the critical path is the requantisation of the
+  final 8-bit layer: a 32-bit multiplier, then rounding.
+* `thresholds=True` also turns that layer into 255 thresholds per output.
+  This removes every DSP but costs 22 k LUTs, so for 8-bit outputs the
+  multiplier is the better choice.
+* Folded, the critical path is the folded `linear` stage, which is not pipelined
+  yet: ROM → 40 multipliers → adder tree → accumulator.
+
 ## Generated hardware
 
 ### Streams and handshake
@@ -185,7 +238,7 @@ products -[products]- tree level 1 -[tree]- level 2 -[tree]- ... last level
 | `"products"` | after the products x·w | 1 |
 | `"tree"` / `"tree:K"` | inside the adder tree, every level / every K levels (never after the last level) | ⌈depth / K⌉ − 1, depth = ⌈log2(IN_F)⌉ |
 | `"acc"` | after the last tree level + bias | 1 |
-| `"mult"` | after the requantisation product (layers that requantise) | 1 |
+| `"mult"` | after the requantisation product, or the threshold comparisons (layers that requantise) | 1 |
 
 `pipeline` takes a stage name, a list of names, or `True` for every stage with the tree registered at every level; the default (`None`) adds nothing. Each register adds one clock of latency; throughput stays one beat per clock.
 

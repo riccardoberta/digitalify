@@ -6,6 +6,8 @@ Each input beat ``x`` (``IN_F`` elements) gives one output beat:
 
     acc_j = (Σ_i W[j][i] · x[i]) · 2^F + BIAS[j]
     y_j   = clip(round(relu(acc_j) · MULT[j] / 2^SHIFT[j]))   or relu(acc_j)
+    or, with threshold activation (bias, ReLU and Quant folded into THRESH):
+    y_j   = THR_BASE[j] + #{k : acc_j >= THRESH[j][k]}
 
 Two architectures, chosen by the ``folding`` option ``(PE, SIMD)``:
 
@@ -17,7 +19,13 @@ Fully parallel (default, ``PE = OUT_F`` and ``SIMD = IN_F``)
             -> +bias -[acc]- ReLU -> x MULT -[mult]- round/clip -[out]-
 
     ``tree`` registers every ``tree_every`` levels (``"tree:K"``), never after
-    the last level; ``mult`` exists only when the layer requantises.
+    the last level; ``mult`` exists only when the layer requantises (with
+    thresholds it registers the comparison results).
+
+Threshold activation
+    The comparisons of one channel form a thermometer code (the thresholds
+    are sorted); a binary search over it gives the count with
+    ceil(log2(N + 1)) multiplexer levels instead of an N-input adder.
 
 Folded (matrix-vector unit)
     ``PE`` neurons x ``SIMD`` inputs per clock: ``PE·SIMD`` multipliers,
@@ -66,7 +74,8 @@ class LinearOperator(VHDLOperator):
             out_f, in_f = node.attrs["weight"].shape
             pe, simd = self.fold(node)
             return 1 + (out_f // pe) * (in_f // simd) + 1
-        has_requant = node.attrs.get("requant") is not None
+        has_requant = (node.attrs.get("requant") is not None
+                       or node.attrs.get("thresholds") is not None)
         return (1 + len(self._mac_cuts(node.attrs["weight"].shape[1]))
                 + ("acc" in self.pipeline)
                 + ("mult" in self.pipeline and has_requant))
@@ -113,7 +122,53 @@ class LinearOperator(VHDLOperator):
         ]
         if a.get("requant") is not None:
             decl += self.requant_decl(a["requant"], ab, out_f)
+        if a.get("thresholds") is not None:
+            decl += self._threshold_decl(node)
         return decl
+
+    def _threshold_decl(self, node: IRNode) -> list[str]:
+        a = node.attrs
+        thr, base = a["thresholds"], a["threshold_base"]
+        ab = a["acc_dtype"].bits
+        n = thr.shape[1]
+        m = n.bit_length()                 # 2^m - 1 >= n
+        rows = [self.aggregate([self.bit_literal(int(v), ab) for v in row], " " * 12) for row in thr]
+        return [
+            "",
+            f"    -- Threshold activation (bias, ReLU, Quant with rounding {a['rounding']}):",
+            "    --   y = THR_BASE(j) + #{k : acc >= THRESH(j)(k)}, exact for any scale",
+            f"    constant N_THR  : natural := {n};    -- thresholds per channel",
+            f"    constant M_THR  : natural := {m};    -- binary-search levels",
+            "    constant NP_THR : natural := 2**M_THR - 1;",
+            "    type thr_row_t is array(0 to N_THR - 1) of signed(ACC_W - 1 downto 0);",
+            "    type thr_t is array(0 to OUT_F - 1) of thr_row_t;",
+            f"    constant THRESH : thr_t := {self.aggregate(rows)};",
+            "    type thr_base_t is array(0 to OUT_F - 1) of integer;",
+            "    constant THR_BASE : thr_base_t := "
+            + self.aggregate([str(int(v)) for v in base]) + ";",
+            "    subtype thermo_t is std_logic_vector(0 to NP_THR - 1);",
+            "    type thermo_vec_t is array(0 to OUT_F - 1) of thermo_t;",
+            "",
+            "    -- Comparisons of one channel: a thermometer code (sorted thresholds)",
+            "    function thermo(a : signed; j : natural) return thermo_t is",
+            "        variable b : thermo_t := (others => '0');",
+            "    begin",
+            "        for k in 0 to N_THR - 1 loop",
+            "            if a >= THRESH(j)(k) then b(k) := '1'; end if;",
+            "        end loop;",
+            "        return b;",
+            "    end function;",
+            "",
+            "    -- Number of ones of a thermometer code, by binary search",
+            "    function thermo_count(b : thermo_t) return natural is",
+            "        variable pos : natural range 0 to NP_THR := 0;",
+            "    begin",
+            "        for l in M_THR - 1 downto 0 loop",
+            "            if b(pos + 2**l - 1) = '1' then pos := pos + 2**l; end if;",
+            "        end loop;",
+            "        return pos;",
+            "    end function;",
+        ]
 
     def _w_lit(self, node: IRNode, v: int) -> str:
         wb = node.attrs["weight_dtype"].bits
@@ -131,6 +186,7 @@ class LinearOperator(VHDLOperator):
         weight = a["weight"]
         out_f, in_f = weight.shape
         rq = a.get("requant")
+        thr = a.get("thresholds") is not None
 
         rows = [self.aggregate([self._w_lit(node, v) for v in weight[j]], " " * 12) for j in range(out_f)]
         decl = self._common_decl(node) + [
@@ -144,11 +200,12 @@ class LinearOperator(VHDLOperator):
         load_x = self.load_element(node.input_dtype, "in_data", "i", "x")
 
         reg_acc = "acc" in self.pipeline
-        reg_mult = "mult" in self.pipeline and rq is not None
+        reg_mult = "mult" in self.pipeline and (rq is not None or thr)
         if reg_acc:
             decl += ["    signal acc_r   : acc_t;", "    signal valid_a : std_logic := '0';"]
         if reg_mult:
-            decl += ["    signal prod_r  : wide_t;", "    signal valid_p : std_logic := '0';"]
+            decl += ["    signal cmp_r   : thermo_vec_t;" if thr else "    signal prod_r  : wide_t;",
+                     "    signal valid_p : std_logic := '0';"]
 
         body = "    in_ready <= ce;\n\n" + self._mac(in_f, load_x)
         decl += self._pending_decl
@@ -161,7 +218,21 @@ class LinearOperator(VHDLOperator):
         relu = ["                    if a < 0 then a := (others => '0'); end if;"] if a.get("relu") else []
         out_slice = self.element("core_data", "j", "Y_W")
 
-        if reg_mult:
+        if thr:
+            if reg_mult:
+                body += self._register(
+                    "mult_reg", "Pipeline register: threshold comparisons", "valid_p", valid_src,
+                    f"for j in 0 to OUT_F - 1 loop cmp_r(j) <= thermo({acc_src}(j), j); end loop;")
+                valid_src = "valid_p"
+                count = "thermo_count(cmp_r(j))"
+            else:
+                count = f"thermo_count(thermo({acc_src}(j), j))"
+            stage = [f"                    y := to_signed(THR_BASE(j) + {count}, Y_W + 1);",
+                     f"                    {out_slice} <= std_logic_vector(y(Y_W - 1 downto 0));"]
+            variables = "        variable y : signed(Y_W downto 0);\n"
+            relu_here = False
+            what = " + threshold count" if reg_mult else " + threshold activation"
+        elif reg_mult:
             body += self._register(
                 "mult_reg", "Pipeline register: " + ("ReLU + " if relu else "") + "requantisation product",
                 "valid_p", valid_src,
@@ -184,14 +255,17 @@ class LinearOperator(VHDLOperator):
                 variables += "        variable p, q, r, half : signed(P_W - 1 downto 0);\n"
                 stage.append("                    p    := resize(a * MULT(j), P_W);")
 
-        if rq is None:
+        if thr:
+            pass
+        elif rq is None:
             stage.append(f"                    {out_slice} <= std_logic_vector(a(Y_W - 1 downto 0));")
         else:
             stage += self.requant_round(rq, "j", " " * 20)
             stage.append(f"                    {out_slice} <= std_logic_vector(q(Y_W - 1 downto 0));")
 
-        what = (" + ReLU" if relu_here else "") + (
-            " + rounding/clipping" if reg_mult else " + requantisation" if rq is not None else "")
+        if not thr:
+            what = (" + ReLU" if relu_here else "") + (
+                " + rounding/clipping" if reg_mult else " + requantisation" if rq is not None else "")
         body += (
             "    -- Output register" + what + "\n"
             "    outp : process(clk)\n" + variables +
@@ -391,7 +465,10 @@ class LinearOperator(VHDLOperator):
         ]
         if a.get("relu"):
             fin.append("                    if a < 0 then a := (others => '0'); end if;")
-        if rq is None:
+        if a.get("thresholds") is not None:
+            fin += ["                    y := to_signed(THR_BASE(j) + thermo_count(thermo(a, j)), Y_W + 1);",
+                    "                    res(k) := std_logic_vector(y(Y_W - 1 downto 0));"]
+        elif rq is None:
             fin.append("                    res(k) := std_logic_vector(a(Y_W - 1 downto 0));")
         else:
             fin.append("                    p := resize(a * MULT(j), P_W);")
@@ -408,6 +485,8 @@ class LinearOperator(VHDLOperator):
         )
         if rq is not None:
             variables += "        variable p, q, r, half : signed(P_W - 1 downto 0);\n"
+        if a.get("thresholds") is not None:
+            variables += "        variable y    : signed(Y_W downto 0);\n"
 
         body = (
             "    in_ready <= ce and not busy;\n\n"

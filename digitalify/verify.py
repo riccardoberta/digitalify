@@ -15,7 +15,7 @@ import numpy as np
 
 from digitalify.frontend.qonnx_importer import from_qonnx, load_qonnx
 from digitalify.ir.graph import IRGraph
-from digitalify.testing.reference import generate_test_vectors
+from digitalify.testing.reference import generate_test_vectors, run_reference
 
 
 @dataclass
@@ -70,6 +70,7 @@ def verify(
     n_vectors: int = 64,
     seed: int = 0,
     tolerance_lsb: float = 0.0,
+    inputs: np.ndarray | None = None,
 ) -> VerificationResult:
     """
     Compare the integer reference model of *model* with QONNX execution.
@@ -86,6 +87,9 @@ def verify(
     tolerance_lsb : float
         Allowed difference in output LSBs (use 1 for models with
         non-power-of-two scales).
+    inputs : np.ndarray, optional
+        Integer inputs in stream order, shape ``(n, H·W·C)`` (for example
+        ``ir.quantize_input(images)``), used instead of generated vectors.
     """
     from qonnx.core.onnx_exec import execute_onnx
 
@@ -93,7 +97,11 @@ def verify(
     if ir is None:
         ir = from_qonnx(mw)
 
-    inputs, reference = generate_test_vectors(ir, n_vectors=n_vectors, seed=seed)
+    if inputs is None:
+        inputs, reference = generate_test_vectors(ir, n_vectors=n_vectors, seed=seed)
+    else:
+        inputs = np.asarray(inputs, dtype=np.int64).reshape(-1, ir.in_size)
+        reference = run_reference(ir, inputs)
     in_name = mw.graph.input[0].name
     out_name = mw.graph.output[0].name
     in_shape = mw.get_tensor_shape(in_name)

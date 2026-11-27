@@ -15,5 +15,6 @@ setup(
     ],
     extras_require={
         "dev": ["pytest>=8", "jupyter", "matplotlib"],
+        "examples": ["torch", "brevitas", "onnxoptimizer"],
     },
 )

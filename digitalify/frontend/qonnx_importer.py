@@ -64,7 +64,7 @@ from digitalify.exceptions import QONNXImportError, UnsupportedOperatorError
 from digitalify.ir.graph import IRGraph
 from digitalify.ir.node import IRNode
 from digitalify.ir.types import IntType
-from digitalify.quant import normalize_rounding, requant_multiplier, to_fraction
+from digitalify.quant import normalize_rounding, quant_thresholds, requant_multiplier, to_fraction
 
 # Ops that only change the logical shape of a tensor.
 _PASSTHROUGH_OPS = {"Flatten", "Reshape", "Identity", "Squeeze", "Unsqueeze"}
@@ -84,6 +84,13 @@ _MAX_ACC_BITS = 62
 
 # Largest input range (values per channel) turned into a lookup table.
 MAX_LUT_ENTRIES = 4096
+
+# Threshold activations: with thresholds="auto", a requantised linear output
+# of at most AUTO_THRESHOLD_BITS bits uses 2^bits - 1 comparisons whenever the
+# multiplier form would be inexact; thresholds=True uses them up to
+# MAX_THRESHOLD_BITS bits.
+AUTO_THRESHOLD_BITS = 4
+MAX_THRESHOLD_BITS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +117,12 @@ def load_qonnx(model):
             "Expected a path, onnx.ModelProto or qonnx ModelWrapper, "
             f"got {type(model).__name__}"
         )
+
+    # Some exporters (torch.onnx dynamo, used by Brevitas >= 0.12) also list
+    # the initializers as graph inputs; they are constants, not inputs.
+    consts = {init.name for init in mw.graph.initializer}
+    for inp in [i for i in mw.graph.input if i.name in consts]:
+        mw.graph.input.remove(inp)
 
     if len(mw.graph.input) != 1 or len(mw.graph.output) != 1:
         raise QONNXImportError(
@@ -322,7 +335,11 @@ def _ints(node, name, default):
 class _Builder:
     """Walks the ONNX graph and appends IR nodes."""
 
-    def __init__(self, mw, ir: IRGraph, max_mult_bits: int, max_bias_frac_bits: int):
+    def __init__(self, mw, ir: IRGraph, max_mult_bits: int, max_bias_frac_bits: int,
+                 thresholds="auto"):
+        if thresholds not in ("auto", True, False):
+            raise ValueError(f"thresholds must be 'auto', True or False, got {thresholds!r}")
+        self.thresholds = thresholds
         self.mw = mw
         self.ir = ir
         self.max_mult_bits = max_mult_bits
@@ -543,6 +560,8 @@ class _Builder:
             relu = True
             cur, nxt = nxt.output[0], _single_consumer(mw, nxt.output[0])
 
+        unit = list(acc_unit)        # real value of one Σ w·x step, per channel
+
         # ---- bias in accumulator units ---------------------------------------
         # A bias that is not an integer multiple of the accumulator scale gets F
         # fractional bits:  acc = (Σ w·x) · 2^F + round(b / unit · 2^F)
@@ -590,6 +609,30 @@ class _Builder:
             hi = qp.qmax
             out_scale = s_y.astype(np.float64)
             cur = nxt.output[0]
+            if self._use_thresholds(qp, requant["exact"] and bias_exact):
+                s_los = np.minimum(t_lo, t_hi).sum(axis=1)
+                s_his = np.maximum(t_lo, t_hi).sum(axis=1)
+                thr, base = self._thresholds(unit, b, [to_fraction(v) for v in s_y],
+                                             requant["rounding"], lo, hi, s_los, s_his)
+                t_min = min([int(s_los.min())] + [int(v) for v in thr.reshape(-1)])
+                t_max = max([int(s_his.max())] + [int(v) for v in thr.reshape(-1)])
+                acc_bits = max(IntType.for_range(t_min, t_max, signed=True).bits, sum_bits)
+                src = self.add("linear", x, (*out_hw, out_f), out_dtype, {
+                    "weight": q_w,
+                    "bias": np.zeros(out_f, dtype=np.int64),
+                    "bias_exact": True,
+                    "bias_frac_bits": 0,
+                    "weight_dtype": w_dtype,
+                    "sum_dtype": IntType(sum_bits, True),
+                    "acc_dtype": IntType(acc_bits, True),
+                    "relu": False,
+                    "requant": None,
+                    "thresholds": thr,
+                    "threshold_base": base,
+                    "rounding": requant["rounding"],
+                }, node.name)
+                return _Tensor(cur, self.shape_of(cur), (*out_hw, out_f), x.spatial or out_hw != (1, 1),
+                               out_dtype, lo, hi, out_scale, src)
         else:
             out_dtype = IntType.for_range(lo, hi)
             out_scale = np.array([float(u) for u in acc_unit])
@@ -608,6 +651,32 @@ class _Builder:
         }, node.name)
         return _Tensor(cur, self.shape_of(cur), out_stream, x.spatial or out_hw != (1, 1),
                        out_dtype, lo, hi, out_scale, src)
+
+    def _use_thresholds(self, qp: _QuantParams, exact: bool) -> bool:
+        if self.thresholds is False or qp.bits > MAX_THRESHOLD_BITS:
+            return False
+        if self.thresholds is True:
+            return True
+        return not exact and qp.bits <= AUTO_THRESHOLD_BITS
+
+    @staticmethod
+    def _thresholds(unit, bias, s_y, rounding, out_lo, out_hi, s_los, s_his):
+        """Per-channel thresholds on the raw sum S = Σ w·x.
+
+        ``out = base[j] + #{k : S >= T[j][k]}``.  Thresholds that every
+        reachable S passes are folded into ``base``; the rows are padded to
+        the same length with ``s_hi + 1``, which no reachable S reaches.
+        """
+        rows, base = [], []
+        for j in range(len(unit)):
+            t = quant_thresholds(unit[j], bias[j], s_y[j], rounding, out_lo, out_hi)
+            s_lo, s_hi = int(s_los[j]), int(s_his[j])
+            base.append(out_lo + sum(1 for v in t if v <= s_lo))
+            rows.append([v for v in t if s_lo < v <= s_hi])
+        n = max(1, max(len(r) for r in rows))
+        thr = np.array([r + [int(s_his[j]) + 1] * (n - len(r)) for j, r in enumerate(rows)],
+                       dtype=np.int64).reshape(len(rows), n)
+        return thr, np.array(base, dtype=np.int64)
 
     def _requant_params(self, qp: _QuantParams, ratios) -> dict:
         mults, shifts, exact = [], [], True
@@ -884,6 +953,13 @@ def _network_input(mw) -> _Tensor:
     )
 
 
+def _input_rounding(mw) -> str:
+    first = _single_consumer(mw, mw.graph.input[0].name)
+    if first is not None and first.op_type == "Quant":
+        return normalize_rounding(str(_attr(first, "rounding_mode", "ROUND")))
+    return "ROUND"
+
+
 # ---------------------------------------------------------------------------
 # Main importer
 # ---------------------------------------------------------------------------
@@ -893,6 +969,7 @@ def from_qonnx(
     name: str | None = None,
     max_mult_bits: int = 32,
     max_bias_frac_bits: int = 16,
+    thresholds="auto",
 ) -> IRGraph:
     """
     Convert a QONNX model into an ``IRGraph``.
@@ -911,6 +988,15 @@ def from_qonnx(
         Maximum fractional accumulator bits used to represent a bias that is
         not an integer multiple of the accumulator scale (e.g. a float bias
         or a folded BatchNorm).  0 rounds such biases to the nearest integer.
+    thresholds : "auto" | bool
+        Implement the bias + [ReLU] + Quant after a linear / conv layer as
+        per-channel integer thresholds on the accumulator (``2^bits - 1``
+        comparisons, like FINN's MultiThreshold) instead of a fixed-point
+        multiplier.  Thresholds are exact for any scale and bias (folded
+        BatchNorm included).  ``"auto"`` (default) uses them when the
+        multiplier form would be approximate and the output has at most
+        ``AUTO_THRESHOLD_BITS`` (4) bits; ``True`` whenever the output has at
+        most ``MAX_THRESHOLD_BITS`` (8) bits; ``False`` never.
 
     Raises
     ------
@@ -930,8 +1016,9 @@ def from_qonnx(
         input_dtype=x.dtype,
         input_range=(x.lo, x.hi),
         input_scale=float(x.scale[0]),
+        input_rounding=_input_rounding(mw),
     )
-    b = _Builder(mw, ir, max_mult_bits, max_bias_frac_bits)
+    b = _Builder(mw, ir, max_mult_bits, max_bias_frac_bits, thresholds)
 
     while x.name != out_name:
         node = _single_consumer(mw, x.name)

@@ -6,6 +6,7 @@ per sample) and is the specification its VHDL must match:
 
   linear       acc[j] = (Σ_i W[j,i]·x[i]) · 2^F + bias[j]      per beat
                acc = max(acc, 0) if relu;  out = requant(acc) or acc
+               or, with thresholds:  out = base[j] + #{k : acc[j] >= T[j][k]}
   relu         max(0, x)
   pad          border of constant ``value``
   swg          one window beat per output position, elements in (kh, kw, c) order
@@ -40,6 +41,9 @@ def _requant(acc: np.ndarray, rq: dict) -> np.ndarray:
 def _linear(x: np.ndarray, node: IRNode) -> np.ndarray:
     a = node.attrs
     acc = ((x @ a["weight"].T) << a.get("bias_frac_bits", 0)) + a["bias"]
+    thr = a.get("thresholds")
+    if thr is not None:
+        return a["threshold_base"] + (acc[..., None] >= thr).sum(axis=-1)
     if a.get("relu"):
         acc = np.maximum(acc, 0)
     rq = a.get("requant")

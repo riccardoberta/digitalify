@@ -48,6 +48,8 @@ class IRGraph:
         when the input Quant node uses ``narrow=1``).
     input_scale : float
         Real value of one input LSB.
+    input_rounding : str
+        Rounding mode of the input Quant node (used by ``quantize_input``).
     output_scale : np.ndarray
         Real value of one output LSB, one entry per output element in stream
         order.
@@ -63,6 +65,7 @@ class IRGraph:
     output_dtype: IntType | None = None
     input_range: tuple[int, int] | None = None
     input_scale: float = 1.0
+    input_rounding: str = "ROUND"
     output_scale: np.ndarray = field(default_factory=lambda: np.ones(1))
 
     def add_node(self, node: IRNode) -> None:
@@ -138,6 +141,21 @@ class IRGraph:
             return np.moveaxis(x.reshape(n, *shape[1:], shape[0]), -1, 1)
         return x.reshape(n, *shape)
 
+    def quantize_input(self, x: np.ndarray) -> np.ndarray:
+        """Real-valued inputs in ONNX layout ``(n, *input_shape)`` → integer
+        hardware inputs in stream order ``(n, H·W·C)``.
+
+        Applies the network's input ``Quant`` node exactly as QONNX does
+        (float32 division by the scale, clipping, then its rounding mode).
+        """
+        from digitalify.quant import round_array
+
+        x = np.asarray(x, dtype=np.float32)
+        x = x.reshape(-1, *self.input_shape)
+        lo, hi = self.input_range
+        q = np.clip(x / np.float32(self.input_scale), lo, hi)
+        return self.onnx_to_stream(round_array(q, self.input_rounding).astype(np.int64))
+
     def summary(self) -> str:
         """Human-readable table of the stages."""
         lines = [f"IRGraph '{self.name}': input {self.input_stream} {self.input_dtype} "
@@ -147,9 +165,11 @@ class IRGraph:
             extra = ""
             if n.op_type == "linear":
                 rq = a.get("requant")
+                thr = a.get("thresholds")
                 extra = (f"  W:{a['weight_dtype']} acc:{a['acc_dtype']}"
                          f"{' +relu' if a.get('relu') else ''}"
-                         + (f" requant({rq['rounding']}{'' if rq['exact'] else ', approx'})"
+                         + (f" thresholds({thr.shape[1]}/channel, {a['rounding']})" if thr is not None
+                            else f" requant({rq['rounding']}{'' if rq['exact'] else ', approx'})"
                             if rq else " (no requant)"))
             elif n.op_type == "swg":
                 extra = f"  kernel {a['kernel']} stride {a['stride']}"

@@ -45,6 +45,25 @@ def normalize_rounding(mode: str) -> str:
     return m
 
 
+def round_array(x, mode: str) -> np.ndarray:
+    """Round a float array with a QONNX rounding mode (as QONNX's Quant node does)."""
+    mode = normalize_rounding(mode)
+    x = np.asarray(x)
+    if mode == "ROUND":
+        return np.round(x)
+    if mode == "CEIL":
+        return np.ceil(x)
+    if mode == "FLOOR":
+        return np.floor(x)
+    if mode == "UP":
+        return np.sign(x) * np.ceil(np.abs(x))
+    if mode == "DOWN":
+        return np.trunc(x)
+    if mode == "HALF_UP":
+        return np.sign(x) * np.floor(np.abs(x) + 0.5)
+    return np.sign(x) * np.ceil(np.abs(x) - 0.5)   # HALF_DOWN
+
+
 def shift_round(p: int, n: int, mode: str) -> int:
     """Return ``R(p / 2**n)`` for integer *p* using exact integer arithmetic.
 
@@ -77,6 +96,64 @@ def shift_round(p: int, n: int, mode: str) -> int:
     if mode == "DOWN":              # towards zero (truncate)
         return q + (r != 0 and p < 0)
     raise ValueError(f"Unknown rounding mode '{mode}'")
+
+
+def round_fraction(x: Fraction, mode: str) -> int:
+    """Exact rounding of a rational with a QONNX rounding mode."""
+    q = math.floor(x)
+    r = x - q                       # in [0, 1)
+    half = Fraction(1, 2)
+    if mode == "FLOOR":
+        return q
+    if mode == "CEIL":
+        return q + (r != 0)
+    if mode == "ROUND":
+        return q + (r > half or (r == half and q % 2 == 1))
+    if mode == "HALF_UP":
+        return q + (r > half or (r == half and x >= 0))
+    if mode == "HALF_DOWN":
+        return q + (r > half or (r == half and x < 0))
+    if mode == "UP":
+        return q + (r != 0 and x > 0)
+    if mode == "DOWN":
+        return q + (r != 0 and x < 0)
+    raise ValueError(f"Unknown rounding mode '{mode}'")
+
+
+def quant_thresholds(c: Fraction, b: Fraction, s_y: Fraction, mode: str,
+                     out_lo: int, out_hi: int) -> list[int]:
+    """Integer thresholds of a monotone quantiser.
+
+    The real value ``v = c·S + b`` (``c > 0``, ``S`` an integer accumulator)
+    is quantised as ``q(S) = clip(R(v / s_y), out_lo, out_hi)``.  Returns
+    ``T[t]`` for ``t = out_lo+1 .. out_hi``: the smallest integer ``S`` with
+    ``q(S) >= t``, so that  ``q(S) = out_lo + #{t : S >= T[t]}``  exactly.
+    """
+    if c <= 0 or s_y <= 0:
+        raise ValueError("quant_thresholds needs c > 0 and s_y > 0")
+
+    def q(S):
+        return round_fraction((c * S + b) / s_y, mode)
+
+    out = []
+    for t in range(out_lo + 1, out_hi + 1):
+        # The rounding boundary is t - 1/2 for the round-to-nearest modes;
+        # try it first, then fall back to a bisection between S values whose
+        # quotient is <= t - 1 (always rounds below t) and >= t (never).
+        guess = math.ceil(((t - Fraction(1, 2)) * s_y - b) / c)
+        if q(guess) >= t and q(guess - 1) < t:
+            out.append(guess)
+            continue
+        lo = math.floor(((t - 1) * s_y - b) / c)     # q(lo) < t
+        hi = math.ceil((t * s_y - b) / c)             # q(hi) >= t
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if q(mid) >= t:
+                hi = mid
+            else:
+                lo = mid
+        out.append(hi)
+    return out
 
 
 def requant_multiplier(M: Fraction, max_bits: int = 32) -> tuple[int, int, bool]:

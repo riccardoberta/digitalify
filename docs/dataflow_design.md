@@ -119,6 +119,21 @@ ONNX lowering:
   become a `lut`.  The table is computed by running that ONNX sub-graph with
   qonnx on every possible input value, so it matches QONNX by construction.
   This requires a small input range (at most 4096 values per channel).
+* **Threshold activations.** For outputs with few bits, the `linear` stage can
+  replace bias + ReLU + `Quant` by `2^B − 1` sorted integer thresholds per
+  channel on the raw sum (FINN's `MultiThreshold`):
+  `y = BASE[j] + #{k : acc >= T[j][k]}`.
+  * The quantiser is monotone in the sum, so the thresholds are computed
+    exactly with rational arithmetic, for every rounding mode.  The result is
+    exact for non-dyadic scales and folded BatchNorm, where the multiplier form
+    is only approximate.
+  * Thresholds that every reachable sum passes are folded into `BASE`.
+  * The comparisons form a thermometer code, counted by binary search
+    (`log2` multiplexer levels).
+  * `thresholds="auto"` uses them when the multiplier form is inexact and the
+    output has at most 4 bits.
+  * On the MNIST example the accumulators shrink from 31 to 15 and from 28 to
+    12 bits, and the 32-bit requantisation multipliers disappear.
 * **Quant** on an already quantised tensor becomes a `requant` stage.
 * **Flatten** of a spatial tensor becomes a `flatten` stage, plus the column
   permutation of the following weights.  Of a `(1, 1, C)` tensor, it is a no-op.
@@ -200,7 +215,8 @@ digitalify/
   bubble per beat).
 * Registering the weight-ROM output and the products in folded `linear`.  The
   first Vivado runs put its critical path there: ROM address → multiplier →
-  SIMD adder tree → accumulator, about 18 ns.
+  SIMD adder tree → accumulator, about 18 ns (55 ns with SIMD = 40 on the
+  MNIST example).
 * A comparison / adder tree in `pool`.  With fully pipelined linear stages the
   sequential max over the window becomes the critical path (7.5 ns on Artix-7).
 * Padding inside the window generator.  A separate `pad` stage emits

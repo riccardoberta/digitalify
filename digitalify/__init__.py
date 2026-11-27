@@ -44,7 +44,8 @@ def convert(model, output_dir: str | None = None, name: str | None = None,
         Extra registers inside every linear layer: ``"products"`` (after
         the products), ``"tree"`` / ``"tree:K"`` (inside the adder tree,
         every level / every K levels), ``"acc"`` (after the adder tree +
-        bias), ``"mult"`` (after the requantisation product); ``True`` for
+        bias), ``"mult"`` (after the requantisation product, or the threshold
+        comparisons); ``True`` for
         all of them.  Default: none (one register per layer).  Each
         register adds one clock of latency and shortens the critical path.
     folding : dict, optional
@@ -81,6 +82,7 @@ def simulate(
     pipeline=None,
     folding=None,
     backpressure: bool = True,
+    inputs=None,
 ):
     """
     QONNX → VHDL → self-checking testbench → GHDL simulation.
@@ -90,7 +92,9 @@ def simulate(
     QONNX model.  ``pipeline`` and ``folding`` have the same meaning as in
     :func:`convert`.  With ``backpressure`` (default) the testbench throttles
     ``in_valid`` and ``out_ready`` pseudo-randomly; with False the reported
-    cycle count measures full throughput.
+    cycle count measures full throughput.  ``inputs`` (integer, stream
+    order, e.g. ``ir.quantize_input(images)``) replaces the generated test
+    vectors.
     Requires GHDL ≥ 3.0 (on PATH, in ``DIGITALIFY_GHDL``, or passed as
     ``ghdl_path``).
 
@@ -109,7 +113,7 @@ def simulate(
     ir = model if isinstance(model, IRGraph) else from_qonnx(model, name=name)
     vhdl_files = VHDLGenerator(pipeline, folding).generate(ir)
     tb_filename, tb_source = generate_testbench(ir, n_vectors=n_vectors, seed=seed,
-                                                backpressure=backpressure)
+                                                backpressure=backpressure, inputs=inputs)
 
     return run_ghdl(
         vhdl_files=vhdl_files,
