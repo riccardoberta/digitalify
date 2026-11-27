@@ -45,7 +45,8 @@ def convert(model, output_dir: str | None = None, name: str | None = None,
         the products), ``"tree"`` / ``"tree:K"`` (inside the adder tree,
         every level / every K levels), ``"acc"`` (after the adder tree +
         bias), ``"mult"`` (after the requantisation product, or the threshold
-        comparisons); ``True`` for
+        comparisons), ``"round"`` (after the rounding decision: floor, round-up
+        bit and saturation flags); ``True`` for
         all of them.  Default: none (one register per layer).  Each
         register adds one clock of latency and shortens the critical path.
     folding : dict, optional

@@ -16,7 +16,7 @@ def ir():
     return digitalify.from_qonnx(make_mlp([16, 8, 4], seed=3))
 
 
-ALL = {"products", "tree", "acc", "mult"}
+ALL = {"products", "tree", "acc", "mult", "round"}
 
 
 @pytest.mark.parametrize("value,stages,every", [
@@ -46,7 +46,7 @@ def test_convert_rejects_bad_pipeline():
 @pytest.mark.parametrize("pipeline,latency", [
     (None, 2), ("acc", 4), ("mult", 4), ("products", 4),
     ("tree", 2 + 3 + 2), ("tree:2", 2 + 1 + 1), ("tree:4", 2),
-    (True, 7 + 6),
+    ("round", 4), (True, 8 + 7),
 ])
 def test_latency(ir, pipeline, latency):
     op = LinearOperator(pipeline)
@@ -65,7 +65,7 @@ def test_mult_stage_needs_requantisation():
     last = raw.nodes[-1]
     assert last.attrs.get("requant") is None
     assert LinearOperator("mult").node_latency(last) == 1
-    # 3 inputs: out + products + 1 tree register (depth 2) + acc; no mult
+    # 3 inputs: out + products + 1 tree register (depth 2) + acc; no mult / round
     assert LinearOperator(True).node_latency(last) == 4
 
 
@@ -112,3 +112,22 @@ def test_testbench_detects_wrong_output(ir, ghdl):
                       tb_entity=f"tb_{ir.name}", ghdl_path=ghdl)
     assert not result.passed
     assert result.n_failed == 1 and result.n_passed == 5
+
+
+@pytest.mark.parametrize("mode", ["ROUND", "HALF_UP", "HALF_DOWN", "UP", "DOWN", "CEIL", "FLOOR"])
+@pytest.mark.parametrize("pipeline, folding", [
+    ("round", None),
+    (["mult", "round"], {"linear_0": (2, 4), "linear_1": (1, 8)}),
+    (["acc", "round"], {"linear_0": (8, 2)}),
+])
+def test_round_stage_matches_reference(mode, pipeline, folding, ghdl):
+    """Split rounding: floor / round-up / saturation flags, then increment + clip.
+    Small outputs with non-power-of-two scales: frequent ties and saturation."""
+    model = make_mlp([16, 8, 4], act_bits=3, output_bits=4, per_channel=True,
+                     pow2_scales=False, rounding_mode=mode, seed=7)
+    ir = digitalify.from_qonnx(model, thresholds=False)
+    assert all(n.attrs.get("requant") is not None for n in ir.nodes)
+    result = digitalify.simulate(ir, n_vectors=24, ghdl_path=ghdl, pipeline=pipeline, folding=folding)
+    assert result.passed, result.summary() + "\n" + result.log[-3000:]
+    vhdl = digitalify.convert(ir, pipeline=pipeline, folding=folding)[f"{ir.name}_linear_0.vhd"]
+    assert "round_reg" in vhdl

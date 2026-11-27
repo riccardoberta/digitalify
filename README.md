@@ -150,24 +150,25 @@ Vivado 2025.1 out-of-context synthesis, Artix-7 XC7A200T, `pipeline=True`, 784 c
 | Configuration | Activation | LUT | FF | DSP | fmax | Power | Images/s |
 |---|---|---|---|---|---|---|---|
 | fully parallel | multiplier (`thresholds=False`) | 55,139 | 77,920 | 136 | 83 MHz | 3.5 W | 106 k |
-| fully parallel | thresholds on the 4-bit layers (`"auto"`, default) | 53,895 | 77,386 | 40 | 88 MHz | 1.6 W | 112 k |
+| fully parallel | thresholds on the 4-bit layers (`"auto"`, default) | 54,281 | 78,145 | 40 | 166 MHz | 1.6 W | 211 k |
 | fully parallel | thresholds everywhere (`True`) | 76,206 | 79,622 | 0 | 83 MHz | 3.9 W | 106 k |
-| folded `linear_1` (16, 24), `linear_2` (2, 40) | `"auto"` | 18,359 | 23,450 | 8 | 98 MHz | 0.9 W | 125 k |
+| folded `linear_1` (16, 24), `linear_2` (2, 40) | `"auto"` | 18,366 | 23,469 | 8 | 166 MHz | 0.9 W | 211 k |
 
-All configurations use 1.5 BRAM (the line buffers).
+All configurations use 1.5 BRAM (the line buffers).  The `thresholds=False`
+and `True` rows were measured before the `"round"` pipeline stage existed.
 
 * With the default thresholds, the two BatchNorm layers need no multiplier at
   all.  96 DSPs go away, power halves, and the requantisation is exact.
-* Fully parallel with `"auto"`, the critical path is the requantisation of the
-  final 8-bit layer: a 32-bit multiplier, then rounding.
-* `thresholds=True` also turns that layer into 255 thresholds per output.
+* `thresholds=True` also turns the final layer into 255 thresholds per output.
   This removes every DSP but costs 22 k LUTs, so for 8-bit outputs the
   multiplier is the better choice.
-* Folded, the design needs a third of the LUTs and 8 DSPs, and it is faster
-  than the fully parallel one.  The critical path is the same final 8-bit
-  requantisation (rounding and clipping after the product register, 10 ns).
-  Before the folded unit was pipelined, it ran at 18 MHz: ROM → 40 multipliers →
-  adder tree → accumulator in one clock.
+* Folded, the design needs a third of the LUTs and 8 DSPs and runs at the same
+  clock.  Before the folded unit was pipelined, it ran at 18 MHz: ROM → 40
+  multipliers → adder tree → accumulator in one clock.
+* The final 8-bit layer's requantisation (31-bit sum × 33-bit multiplier,
+  shift by 51) limited both versions to 88–98 MHz while rounding and clipping
+  took one clock.  The `"round"` stage splits them, and the critical path is now
+  the saturation test on the floor (6 ns).
 
 ## Generated hardware
 
@@ -234,7 +235,7 @@ The line buffers map to block RAM. With full pipelining the critical path moves 
 
 ```
 products -[products]- tree level 1 -[tree]- level 2 -[tree]- ... last level
-    -> +bias -[acc]- ReLU -> x MULT -[mult]- round/clip -[out]-
+    -> +bias -[acc]- ReLU -> x MULT -[mult]- floor/round-up/saturate -[round]- +1/clip -[out]-
 ```
 
 | Stage | Register | Extra latency per layer |
@@ -243,6 +244,7 @@ products -[products]- tree level 1 -[tree]- level 2 -[tree]- ... last level
 | `"tree"` / `"tree:K"` | inside the adder tree, every level / every K levels (never after the last level) | ⌈depth / K⌉ − 1, depth = ⌈log2(IN_F)⌉ |
 | `"acc"` | after the last tree level + bias | 1 |
 | `"mult"` | after the requantisation product, or the threshold comparisons (layers that requantise) | 1 |
+| `"round"` | after the floor, round-up bit and saturation flags (layers with a multiplier requantisation); the next clock is only a `Y_W`-bit increment and a multiplexer | 1 |
 
 `pipeline` takes a stage name, a list of names, or `True` for every stage with the tree registered at every level; the default (`None`) adds nothing. Each register adds one clock of latency; throughput does not change.
 
@@ -250,7 +252,7 @@ Folded stages get the same registers on their datapath (the tree is the `SIMD`-i
 
 ```
 weight ROM -[products]- products -[products]- SIMD adder tree -[tree]-
-    -> accumulate -> +bias -[acc]- ReLU -> x MULT -[mult]- round/clip
+    -> accumulate -> +bias -[acc]- ReLU -> x MULT -[mult]- floor/flags -[round]- +1/clip
 ```
 
 Measured on the 16→8→4 MLP (4-bit weights; Artix-7 xc7a200t, out-of-context, post-synthesis estimates, before the streaming interface was added):

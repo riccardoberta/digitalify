@@ -163,8 +163,14 @@ with the `pipeline` options).  Otherwise the unit is folded:
   fold, neuron fold.  The `pipeline` option places registers as in the fully
   parallel unit: weight-ROM word and products (`products`), SIMD adder tree
   (`tree`), after bias (`acc`), after the requantisation product or threshold
-  comparisons (`mult`).  On the MNIST example this takes the folded design
-  from 18 to 98 MHz.
+  comparisons (`mult`), after the rounding decision (`round`).  On the MNIST
+  example this takes the folded design from 18 to 166 MHz.
+* Rounding pipeline (`round`, both architectures).  `clip(floor + inc)` is
+  decided from the floor alone: `floor >= CLIP_MAX` gives `CLIP_MAX`,
+  `floor < CLIP_MIN` gives `CLIP_MIN`, otherwise `floor + inc` fits the output.
+  So the first clock registers the low `Y_W` bits of the floor, the round-up
+  bit and two saturation flags.  The second clock is a `Y_W`-bit increment and
+  a multiplexer.
 
 The user passes `folding={"linear_0": (PE, SIMD), ...}` to `convert` /
 `simulate`.  Layers not listed stay fully parallel.  A helper that chooses
@@ -220,9 +226,9 @@ digitalify/
 * Block-RAM line buffers with synchronous read, for large images (the first
   version uses distributed RAM with asynchronous read).
 * Automatic folding for a target throughput or resource budget.
-* Splitting the requantisation of wide outputs (8-bit, 31-bit accumulator)
-  into more stages: after the folded unit was pipelined, rounding and clipping
-  after the product register limit the MNIST example to about 98 MHz.
+* Narrower floor and comparisons in the `round` stage: the floor of a
+  64-bit product shifted by 51 is compared at full width (6 ns, the MNIST
+  critical path at 166 MHz).  `P_W - SHIFT` bits would do.
 * A comparison / adder tree in `pool`.  With fully pipelined linear stages the
   sequential max over the window becomes the critical path (7.5 ns on Artix-7).
 * Padding inside the window generator.  A separate `pad` stage emits

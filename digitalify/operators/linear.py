@@ -16,7 +16,7 @@ Fully parallel (default, ``PE = OUT_F`` and ``SIMD = IN_F``)
     with optional pipeline registers (``pipeline`` option, one clock each):
 
         products -[products]- tree level 1 -[tree]- ... last level
-            -> +bias -[acc]- ReLU -> x MULT -[mult]- round/clip -[out]-
+            -> +bias -[acc]- ReLU -> x MULT -[mult]- floor/flags -[round]- +1/clip -[out]-
 
     ``tree`` registers every ``tree_every`` levels (``"tree:K"``), never after
     the last level; ``mult`` exists only when the layer requantises (with
@@ -37,7 +37,7 @@ Folded (matrix-vector unit)
     The ``pipeline`` option adds the same registers to this datapath:
 
         weight ROM -[products]- products -[products]- SIMD adder tree -[tree]-
-            -> accumulate -> +bias -[acc]- ReLU -> x MULT -[mult]- round/clip
+            -> accumulate -> +bias -[acc]- ReLU -> x MULT -[mult]- floor/flags -[round]- +1/clip
 
     ("products" registers both the ROM word with its input slice and the
     products).  Each work item carries its tags (valid, first / last synapse
@@ -51,7 +51,7 @@ the accumulator can never overflow; results are bit-exact with
 from __future__ import annotations
 
 from digitalify.ir.node import IRNode
-from digitalify.operators.base import VHDLOperator
+from digitalify.operators.base import VHDLOperator, requant_finish, requant_floor, round_decl
 
 
 class LinearOperator(VHDLOperator):
@@ -85,13 +85,15 @@ class LinearOperator(VHDLOperator):
                            or node.attrs.get("thresholds") is not None)
             return (1 + (out_f // pe) * (in_f // simd) + 1
                     + ("products" in self.pipeline) + len(self._mac_cuts(simd))
-                    + ("acc" in self.pipeline)
-                    + ("mult" in self.pipeline and has_requant))
-        has_requant = (node.attrs.get("requant") is not None
-                       or node.attrs.get("thresholds") is not None)
-        return (1 + len(self._mac_cuts(node.attrs["weight"].shape[1]))
-                + ("acc" in self.pipeline)
-                + ("mult" in self.pipeline and has_requant))
+                    + self._tail_registers(node))
+        return 1 + len(self._mac_cuts(node.attrs["weight"].shape[1])) + self._tail_registers(node)
+
+    def _tail_registers(self, node: IRNode) -> int:
+        """Registers after the accumulator: acc, mult, round."""
+        rq = node.attrs.get("requant") is not None
+        return (("acc" in self.pipeline)
+                + ("mult" in self.pipeline and (rq or node.attrs.get("thresholds") is not None))
+                + ("round" in self.pipeline and rq))
 
     def describe(self, node: IRNode) -> str:
         out_f, in_f = node.attrs["weight"].shape
@@ -269,17 +271,31 @@ class LinearOperator(VHDLOperator):
                 variables += "        variable p, q, r, half : signed(P_W - 1 downto 0);\n"
                 stage.append("                    p    := resize(a * MULT(j), P_W);")
 
+        reg_round = "round" in self.pipeline and rq is not None
+        if not thr:
+            what = (" + ReLU" if relu_here else "") + (
+                " + rounding/clipping" if reg_mult else " + requantisation" if rq is not None else "")
         if thr:
             pass
         elif rq is None:
             stage.append(f"                    {out_slice} <= std_logic_vector(a(Y_W - 1 downto 0));")
+        elif reg_round:
+            body += self._register(
+                "round_reg", "Pipeline register: floor, round-up and saturation flags",
+                "valid_r", valid_src,
+                "for j in 0 to OUT_F - 1 loop\n"
+                + "".join(line + "\n" for line in stage + requant_floor(rq, "j", " " * 20, "rnd", "j"))
+                + "                end loop;",
+                variables=variables)
+            decl += round_decl("rnd", "OUT_F") + ["    signal valid_r : std_logic := '0';"]
+            valid_src = "valid_r"
+            stage = requant_finish(" " * 20, "rnd", "j") + [
+                f"                    {out_slice} <= std_logic_vector(u);"]
+            variables = "        variable u : unsigned(Y_W - 1 downto 0);\n"
+            what = " + increment/clipping"
         else:
             stage += self.requant_round(rq, "j", " " * 20)
             stage.append(f"                    {out_slice} <= std_logic_vector(q(Y_W - 1 downto 0));")
-
-        if not thr:
-            what = (" + ReLU" if relu_here else "") + (
-                " + rounding/clipping" if reg_mult else " + requantisation" if rq is not None else "")
         body += (
             "    -- Output register" + what + "\n"
             "    outp : process(clk)\n" + variables +
@@ -680,8 +696,7 @@ class LinearOperator(VHDLOperator):
                 fin = [f"{ind}y := to_signed(THR_BASE(j) + thermo_count(cmp_r(k)), Y_W + 1);",
                        f"{ind}res(k) := std_logic_vector(y(Y_W - 1 downto 0));"]
             else:
-                fin = [f"{ind}p := prod_r(k);"] + self.requant_round(rq, "j", ind) + [
-                    f"{ind}res(k) := std_logic_vector(q(Y_W - 1 downto 0));"]
+                pre = [f"{ind}p := prod_r(k);"]
         else:
             fin = [ind + line for line in get_a]
             if thr:
@@ -690,11 +705,30 @@ class LinearOperator(VHDLOperator):
             elif rq is None:
                 fin.append(f"{ind}res(k) := std_logic_vector(a(Y_W - 1 downto 0));")
             else:
-                fin.append(f"{ind}p := resize(a * MULT(j), P_W);")
-                fin += self.requant_round(rq, "j", ind)
-                fin.append(f"{ind}res(k) := std_logic_vector(q(Y_W - 1 downto 0));")
+                pre = fin + [f"{ind}p := resize(a * MULT(j), P_W);"]
 
-        variables = (a_var + j_var +
+        u_var = ""
+        if rq is not None and "round" in self.pipeline:
+            decl += round_decl("rnd", "PE") + [
+                "    signal r_v  : std_logic := '0';",
+                "    signal r_nf : natural range 0 to NF - 1 := 0;"]
+            body += clocked(
+                "round_reg", "Pipeline register: floor, round-up and saturation flags", "r_v",
+                f"                r_v  <= {fv};\n"
+                f"                r_nf <= {fnf};\n"
+                "                for k in 0 to PE - 1 loop\n"
+                f"                    j := {fnf} * PE + k;\n"
+                + "".join(line[4:] + "\n" for line in pre + requant_floor(rq, "j", ind, "rnd", "k")) +
+                "                end loop;\n",
+                a_var + j_var + "        variable p, q, r, half : signed(P_W - 1 downto 0);\n")
+            fv, fnf = "r_v", "r_nf"
+            fin = requant_finish(ind, "rnd", "k") + [f"{ind}res(k) := std_logic_vector(u);"]
+            u_var = "        variable u : unsigned(Y_W - 1 downto 0);\n"
+        elif rq is not None:
+            fin = pre + self.requant_round(rq, "j", ind) + [
+                f"{ind}res(k) := std_logic_vector(q(Y_W - 1 downto 0));"]
+
+        variables = (a_var + j_var + u_var +
                      "        variable res : pe_out_t;\n"
                      "        variable ob  : std_logic_vector(OUT_F * Y_W - 1 downto 0);\n")
         if rq is not None:

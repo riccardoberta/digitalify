@@ -29,7 +29,9 @@ from digitalify.ir.types import IntType
 #:                ("tree:2" = every 2 levels; plain "tree" = every level)
 #:   "acc"      — after the adder tree + bias (before ReLU / requantisation)
 #:   "mult"     — after the requantisation product ``acc · MULT`` (before rounding)
-PIPELINE_STAGES = ("products", "tree", "acc", "mult")
+#:   "round"    — after the floor, round-up and saturation decisions (before the
+#:                final Y_W-bit increment and clipping multiplexer)
+PIPELINE_STAGES = ("products", "tree", "acc", "mult", "round")
 
 
 @dataclass(frozen=True)
@@ -286,6 +288,49 @@ class VHDLOperator(ABC):
             "end if;",
         ]
         return [indent + line for line in lines]
+
+
+# ``round`` pipeline register split of :meth:`VHDLOperator.requant_round`:
+#   q = clip(floor + inc) is decided from the floor alone,
+#   floor >= CLIP_MAX -> CLIP_MAX,  floor < CLIP_MIN -> CLIP_MIN,
+#   otherwise floor + inc, which fits the Y_W-bit output, so the second clock
+#   is only a Y_W-bit increment and a multiplexer.
+def requant_floor(rq: dict, j: str, indent: str, dst: str, idx: str) -> list[str]:
+    """Statements (product in variable ``p``) loading the round registers
+    ``{dst}_q / _inc / _hi / _lo ({idx})``; uses variables q, r, half."""
+    cond = ROUND_UP_CONDITION[rq["rounding"]]
+    lines = [
+        f"q    := shift_right(p, SHIFT({j}));     -- floor",
+        f"r    := p and SHIFT_MASK({j});          -- discarded bits",
+        f"half := SHIFT_HALF({j});",
+        f"{dst}_q({idx}) <= std_logic_vector(q(Y_W - 1 downto 0));",
+        (f"if {cond} then {dst}_inc({idx}) <= '1'; else {dst}_inc({idx}) <= '0'; end if;"
+         if cond else f"{dst}_inc({idx}) <= '0';"),
+        f"if q >= CLIP_MAX then {dst}_hi({idx}) <= '1'; else {dst}_hi({idx}) <= '0'; end if;",
+        f"if q < CLIP_MIN then {dst}_lo({idx}) <= '1'; else {dst}_lo({idx}) <= '0'; end if;",
+    ]
+    return [indent + line for line in lines]
+
+
+def requant_finish(indent: str, src: str, idx: str) -> list[str]:
+    """Statements turning the round registers into the result in the
+    ``unsigned(Y_W - 1 downto 0)`` variable ``u``."""
+    lines = [
+        f"u := unsigned({src}_q({idx}));",
+        f"if {src}_inc({idx}) = '1' then u := u + 1; end if;",
+        f"if {src}_hi({idx}) = '1' then u := unsigned(CLIP_MAX(Y_W - 1 downto 0));",
+        f"elsif {src}_lo({idx}) = '1' then u := unsigned(CLIP_MIN(Y_W - 1 downto 0));",
+        "end if;",
+    ]
+    return [indent + line for line in lines]
+
+
+def round_decl(dst: str, count: str) -> list[str]:
+    return [
+        f"    type {dst}_q_t is array(0 to {count} - 1) of std_logic_vector(Y_W - 1 downto 0);",
+        f"    signal {dst}_q : {dst}_q_t;",
+        f"    signal {dst}_inc, {dst}_hi, {dst}_lo : std_logic_vector(0 to {count} - 1);",
+    ]
 
 
 def stream_ports(in_bits: int, out_bits: int) -> str:
