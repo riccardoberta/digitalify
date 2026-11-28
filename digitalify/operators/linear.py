@@ -137,7 +137,7 @@ class LinearOperator(VHDLOperator):
             + self.aggregate([self.bit_literal(v, ab) for v in a["bias"]]) + ";",
         ]
         if a.get("requant") is not None:
-            decl += self.requant_decl(a["requant"], ab, out_f)
+            decl += self.requant_decl(a["requant"], ab, out_f, node.output_dtype.bits)
         if a.get("thresholds") is not None:
             decl += self._threshold_decl(node)
         return decl
@@ -261,14 +261,14 @@ class LinearOperator(VHDLOperator):
             )
             valid_src = "valid_p"
             stage = ["                    p    := prod_r(j);"]
-            variables = "        variable p, q, r, half : signed(P_W - 1 downto 0);\n"
+            variables = "        variable p, q, grd, stk : signed(P_W - 1 downto 0);\n"
             relu_here = False
         else:
             stage = [f"                    a := {acc_src}(j);"] + relu
             relu_here = bool(relu)
             variables = "        variable a : signed(ACC_W - 1 downto 0);\n"
             if rq is not None:
-                variables += "        variable p, q, r, half : signed(P_W - 1 downto 0);\n"
+                variables += "        variable p, q, grd, stk : signed(P_W - 1 downto 0);\n"
                 stage.append("                    p    := resize(a * MULT(j), P_W);")
 
         reg_round = "round" in self.pipeline and rq is not None
@@ -720,7 +720,7 @@ class LinearOperator(VHDLOperator):
                 f"                    j := {fnf} * PE + k;\n"
                 + "".join(line[4:] + "\n" for line in pre + requant_floor(rq, "j", ind, "rnd", "k")) +
                 "                end loop;\n",
-                a_var + j_var + "        variable p, q, r, half : signed(P_W - 1 downto 0);\n")
+                a_var + j_var + "        variable p, q, grd, stk : signed(P_W - 1 downto 0);\n")
             fv, fnf = "r_v", "r_nf"
             fin = requant_finish(ind, "rnd", "k") + [f"{ind}res(k) := std_logic_vector(u);"]
             u_var = "        variable u : unsigned(Y_W - 1 downto 0);\n"
@@ -732,7 +732,7 @@ class LinearOperator(VHDLOperator):
                      "        variable res : pe_out_t;\n"
                      "        variable ob  : std_logic_vector(OUT_F * Y_W - 1 downto 0);\n")
         if rq is not None:
-            variables += "        variable p, q, r, half : signed(P_W - 1 downto 0);\n"
+            variables += "        variable p, q, grd, stk : signed(P_W - 1 downto 0);\n"
         if thr:
             variables += "        variable y : signed(Y_W downto 0);\n"
         body += clocked(

@@ -164,13 +164,19 @@ with the `pipeline` options).  Otherwise the unit is folded:
   parallel unit: weight-ROM word and products (`products`), SIMD adder tree
   (`tree`), after bias (`acc`), after the requantisation product or threshold
   comparisons (`mult`), after the rounding decision (`round`).  On the MNIST
-  example this takes the folded design from 18 to 166 MHz.
+  example this takes the folded design from 18 to 174 MHz.
 * Rounding pipeline (`round`, both architectures).  `clip(floor + inc)` is
   decided from the floor alone: `floor >= CLIP_MAX` gives `CLIP_MAX`,
   `floor < CLIP_MIN` gives `CLIP_MIN`, otherwise `floor + inc` fits the output.
   So the first clock registers the low `Y_W` bits of the floor, the round-up
   bit and two saturation flags.  The second clock is a `Y_W`-bit increment and
   a multiplexer.
+* No wide comparison in the rounding.  The discarded bits `r` are compared
+  with `half = 2^(SHIFT-1)` through the guard bit `p(SHIFT-1)` and the OR of
+  the sticky bits below it (`r > half` = guard and sticky, `r = half` = guard
+  and not sticky, `r /= 0` = guard or sticky).  The saturation flags compare
+  the floor on its `FL_W = P_W - min(SHIFT)` significant bits.  On the MNIST
+  example the 64-bit carry chains go away: 166 → 174 MHz.
 
 The user passes `folding={"linear_0": (PE, SIMD), ...}` to `convert` /
 `simulate`.  Layers not listed stay fully parallel.  A helper that chooses
@@ -226,9 +232,9 @@ digitalify/
 * Block-RAM line buffers with synchronous read, for large images (the first
   version uses distributed RAM with asynchronous read).
 * Automatic folding for a target throughput or resource budget.
-* Narrower floor and comparisons in the `round` stage: the floor of a
-  64-bit product shifted by 51 is compared at full width (6 ns, the MNIST
-  critical path at 166 MHz).  `P_W - SHIFT` bits would do.
+* Pipelined wide requantisation multiplier: the 31 × 33-bit product of the
+  final MNIST layer is a cascade of four DSP48 without internal registers
+  (4.3 ns, the critical path at 174 MHz).
 * A comparison / adder tree in `pool`.  With fully pipelined linear stages the
   sequential max over the window becomes the critical path (7.5 ns on Artix-7).
 * Padding inside the window generator.  A separate `pad` stage emits

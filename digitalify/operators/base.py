@@ -85,15 +85,20 @@ def normalize_pipeline(pipeline) -> Pipeline:
     return Pipeline(frozenset(stages), tree_every)
 
 
-# VHDL condition (on p, q, r, half) under which floor(p / 2^n) is incremented.
+# VHDL condition under which floor(p / 2^n) is incremented.  The discarded
+# bits r = p mod 2^n are compared with half = 2^(n-1) through the guard bit
+# grd = p and 2^(n-1) and the sticky bits stk = p and (2^(n-1) - 1):
+#   r > half <=> grd and stk,  r = half (/= 0) <=> grd and not stk,
+#   r /= 0 <=> grd or stk.
+# Two OR-reductions instead of an n-bit comparison (no carry chain).
 ROUND_UP_CONDITION = {
     "FLOOR": None,
-    "CEIL": "r /= 0",
-    "ROUND": "r > half or (r = half and r /= 0 and q(0) = '1')",
-    "HALF_UP": "r > half or (r = half and r /= 0 and p >= 0)",
-    "HALF_DOWN": "r > half or (r = half and r /= 0 and p < 0)",
-    "UP": "r /= 0 and p > 0",
-    "DOWN": "r /= 0 and p < 0",
+    "CEIL": "grd /= 0 or stk /= 0",
+    "ROUND": "grd /= 0 and (stk /= 0 or q(0) = '1')",
+    "HALF_UP": "grd /= 0 and (stk /= 0 or p >= 0)",
+    "HALF_DOWN": "grd /= 0 and (stk /= 0 or p < 0)",
+    "UP": "(grd /= 0 or stk /= 0) and p > 0",
+    "DOWN": "(grd /= 0 or stk /= 0) and p < 0",
 }
 
 
@@ -243,13 +248,18 @@ class VHDLOperator(ABC):
     # Requantisation (shared by linear and requant)
     # ------------------------------------------------------------------
 
-    def requant_decl(self, rq: dict, in_bits: int, count: int) -> list[str]:
+    def requant_decl(self, rq: dict, in_bits: int, count: int, out_bits: int = 0) -> list[str]:
         """Constants MULT / SHIFT / masks / clip bounds for *count* channels;
-        *in_bits* is the signed width of the value being scaled."""
+        *in_bits* is the signed width of the value being scaled, *out_bits*
+        the output width Y_W (the narrowed floor FL_W keeps at least Y_W + 1)."""
         mults = [int(m) for m in rq["multiplier"]]
         shifts = [int(n) for n in rq["shift"]]
         mb = max(m.bit_length() for m in mults) + 1           # + sign bit
         pw = max(in_bits + mb, max(shifts) + 2)
+        # |p| < 2^(P_W-1), so floor(p / 2^SHIFT) fits P_W - SHIFT signed bits;
+        # the clip bounds fit cw signed bits.
+        cw = max(int(rq["clip_min"]).bit_length(), int(rq["clip_max"]).bit_length()) + 1
+        fw = min(pw, max(pw - min(shifts), cw, out_bits + 1))
         return [
             "",
             "    -- Requantisation: q = clip(round(a * MULT / 2^SHIFT))",
@@ -260,24 +270,27 @@ class VHDLOperator(ABC):
             "    constant MULT : mult_t := "
             + self.aggregate([self.bit_literal(m, mb) for m in mults]) + ";",
             f"    type wide_t is array(0 to {count - 1}) of signed(P_W - 1 downto 0);",
-            "    constant SHIFT_MASK : wide_t := "
-            + self.aggregate([self.bit_literal((1 << n) - 1, pw) for n in shifts]) + ";",
-            "    constant SHIFT_HALF : wide_t := "
+            "    constant GUARD_BIT : wide_t := "     # 2^(SHIFT-1): the half
             + self.aggregate([self.bit_literal((1 << (n - 1)) if n else 0, pw) for n in shifts]) + ";",
+            "    constant STICKY_MASK : wide_t := "   # the bits below it
+            + self.aggregate([self.bit_literal((1 << (n - 1)) - 1 if n else 0, pw) for n in shifts]) + ";",
             f"    type shift_t is array(0 to {count - 1}) of natural;",
             "    constant SHIFT : shift_t := " + self.aggregate([str(n) for n in shifts]) + ";",
             f"    constant CLIP_MIN : signed(P_W - 1 downto 0) := {self.bit_literal(rq['clip_min'], pw)};",
             f"    constant CLIP_MAX : signed(P_W - 1 downto 0) := {self.bit_literal(rq['clip_max'], pw)};",
+            f"    constant FL_W : natural := {fw};    -- significant floor bits (P_W - min SHIFT)",
+            f"    constant CLIP_MIN_F : signed(FL_W - 1 downto 0) := {self.bit_literal(rq['clip_min'], fw)};",
+            f"    constant CLIP_MAX_F : signed(FL_W - 1 downto 0) := {self.bit_literal(rq['clip_max'], fw)};",
         ]
 
     @staticmethod
     def requant_round(rq: dict, j: str, indent: str) -> list[str]:
         """Statements turning the product in variable ``p`` (channel *j*) into
-        the clipped result in variable ``q`` (variables r, half also used)."""
+        the clipped result in variable ``q`` (variables grd, stk also used)."""
         lines = [
             f"q    := shift_right(p, SHIFT({j}));     -- floor",
-            f"r    := p and SHIFT_MASK({j});          -- discarded bits",
-            f"half := SHIFT_HALF({j});",
+            f"grd  := p and GUARD_BIT({j});           -- discarded bits: half",
+            f"stk  := p and STICKY_MASK({j});         -- and below",
         ]
         cond = ROUND_UP_CONDITION[rq["rounding"]]
         if cond:
@@ -297,17 +310,18 @@ class VHDLOperator(ABC):
 #   is only a Y_W-bit increment and a multiplexer.
 def requant_floor(rq: dict, j: str, indent: str, dst: str, idx: str) -> list[str]:
     """Statements (product in variable ``p``) loading the round registers
-    ``{dst}_q / _inc / _hi / _lo ({idx})``; uses variables q, r, half."""
+    ``{dst}_q / _inc / _hi / _lo ({idx})``; uses variables q, grd, stk."""
     cond = ROUND_UP_CONDITION[rq["rounding"]]
+    f = "q(FL_W - 1 downto 0)"            # the floor without its sign copies
     lines = [
         f"q    := shift_right(p, SHIFT({j}));     -- floor",
-        f"r    := p and SHIFT_MASK({j});          -- discarded bits",
-        f"half := SHIFT_HALF({j});",
+        f"grd  := p and GUARD_BIT({j});           -- discarded bits: half",
+        f"stk  := p and STICKY_MASK({j});         -- and below",
         f"{dst}_q({idx}) <= std_logic_vector(q(Y_W - 1 downto 0));",
         (f"if {cond} then {dst}_inc({idx}) <= '1'; else {dst}_inc({idx}) <= '0'; end if;"
          if cond else f"{dst}_inc({idx}) <= '0';"),
-        f"if q >= CLIP_MAX then {dst}_hi({idx}) <= '1'; else {dst}_hi({idx}) <= '0'; end if;",
-        f"if q < CLIP_MIN then {dst}_lo({idx}) <= '1'; else {dst}_lo({idx}) <= '0'; end if;",
+        f"if {f} >= CLIP_MAX_F then {dst}_hi({idx}) <= '1'; else {dst}_hi({idx}) <= '0'; end if;",
+        f"if {f} < CLIP_MIN_F then {dst}_lo({idx}) <= '1'; else {dst}_lo({idx}) <= '0'; end if;",
     ]
     return [indent + line for line in lines]
 

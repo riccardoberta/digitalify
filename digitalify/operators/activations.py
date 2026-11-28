@@ -115,5 +115,5 @@ class RequantOperator(VHDLOperator):
             "                end loop;",
         ]
         variables = (f"        variable x : signed({xb} downto 0);\n"
-                     "        variable p, q, r, half : signed(P_W - 1 downto 0);\n")
+                     "        variable p, q, grd, stk : signed(P_W - 1 downto 0);\n")
         return decl, _registered(stmts, variables, label="requant")

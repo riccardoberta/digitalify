@@ -150,9 +150,9 @@ Vivado 2025.1 out-of-context synthesis, Artix-7 XC7A200T, `pipeline=True`, 784 c
 | Configuration | Activation | LUT | FF | DSP | fmax | Power | Images/s |
 |---|---|---|---|---|---|---|---|
 | fully parallel | multiplier (`thresholds=False`) | 55,139 | 77,920 | 136 | 83 MHz | 3.5 W | 106 k |
-| fully parallel | thresholds on the 4-bit layers (`"auto"`, default) | 54,281 | 78,145 | 40 | 166 MHz | 1.6 W | 211 k |
+| fully parallel | thresholds on the 4-bit layers (`"auto"`, default) | 53,444 | 77,967 | 40 | 174 MHz | 1.6 W | 222 k |
 | fully parallel | thresholds everywhere (`True`) | 76,206 | 79,622 | 0 | 83 MHz | 3.9 W | 106 k |
-| folded `linear_1` (16, 24), `linear_2` (2, 40) | `"auto"` | 18,366 | 23,469 | 8 | 166 MHz | 0.9 W | 211 k |
+| folded `linear_1` (16, 24), `linear_2` (2, 40) | `"auto"` | 18,182 | 23,469 | 8 | 174 MHz | 0.9 W | 222 k |
 
 All configurations use 1.5 BRAM (the line buffers).  The `thresholds=False`
 and `True` rows were measured before the `"round"` pipeline stage existed.
@@ -167,8 +167,11 @@ and `True` rows were measured before the `"round"` pipeline stage existed.
   multipliers → adder tree → accumulator in one clock.
 * The final 8-bit layer's requantisation (31-bit sum × 33-bit multiplier,
   shift by 51) limited both versions to 88–98 MHz while rounding and clipping
-  took one clock.  The `"round"` stage splits them, and the critical path is now
-  the saturation test on the floor (6 ns).
+  took one clock.  The `"round"` stage splits them.  The round-up bit comes
+  from a guard bit and an OR of the sticky bits, and the saturation flags
+  compare only the floor's significant bits, so no wide carry chain is left
+  (166 → 174 MHz).  The critical path is now the 31 × 33-bit product itself,
+  a cascade of four DSP48 without internal registers (4.3 ns).
 
 ## Generated hardware
 
