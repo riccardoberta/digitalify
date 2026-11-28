@@ -192,3 +192,34 @@ def test_activation_without_quant_is_rejected():
     # the Sigmoid input is a raw accumulator: its range is too large for a table
     with pytest.raises(UnsupportedOperatorError, match="too large for a lookup table"):
         digitalify.from_qonnx(model)
+
+
+# ---- pool tree --------------------------------------------------------------------
+
+POOLS = {
+    "max2x2": ((3, 8, 8), [dict(type="conv", out=4, kernel=3, pad=1), dict(type="maxpool")]),
+    "max3x3": ((2, 9, 9), [dict(type="conv", out=3, kernel=3, pad=1),
+                           dict(type="maxpool", kernel=3, stride=3)]),
+    "avg3x3": ((2, 9, 9), [dict(type="conv", out=3, kernel=3, pad=1), dict(type="avgpool", kernel=3, stride=3),
+                           dict(type="quant", bits=6, signed=False)]),
+    "max1d": ((3, 16), [dict(type="conv", out=4, kernel=3, pad=1), dict(type="maxpool")]),
+}
+
+
+@pytest.mark.parametrize("pipeline", [None, "pool"])
+@pytest.mark.parametrize("variant", sorted(POOLS))
+def test_pool_tree_matches_reference(variant, pipeline, ghdl):
+    shape, layers = POOLS[variant]
+    model = make_cnn(shape, layers, seed=4)
+    result = digitalify.simulate(model, n_vectors=3, ghdl_path=ghdl, pipeline=pipeline)
+    assert result.passed, result.summary() + "\n" + result.log[-3000:]
+
+
+@pytest.mark.parametrize("window,latency", [(1, 1), (2, 1), (4, 2), (9, 2)])
+def test_pool_register_only_for_deep_trees(window, latency):
+    from digitalify.operators.window import PoolOperator
+
+    class N:                    # node_latency reads only the attributes
+        attrs = {"window": window, "mode": "max"}
+    assert PoolOperator("pool").node_latency(N) == latency
+    assert PoolOperator(None).node_latency(N) == 1

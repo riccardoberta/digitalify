@@ -16,7 +16,7 @@ def ir():
     return digitalify.from_qonnx(make_mlp([16, 8, 4], seed=3))
 
 
-ALL = {"products", "tree", "acc", "mult", "round"}
+ALL = {"products", "tree", "acc", "mult", "round", "pool"}
 
 
 @pytest.mark.parametrize("value,stages,every", [

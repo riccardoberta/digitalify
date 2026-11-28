@@ -90,7 +90,7 @@ every stage simple and testable on its own.
 | `relu` | `max(0, x)` per element | 1/clock |
 | `pad` | inserts border pixels with a constant value | emits `Hp·Wp` beats per `H·W` input beats |
 | `swg` | sliding window generator: line buffers + window registers; emits a `KH·KW·C` window beat per output position (stride applied) | 1 input beat/clock |
-| `pool` | per-channel max or sum over a window beat | 1/clock |
+| `pool` | per-channel max or sum over a window beat (balanced tree, optional `"pool"` register halfway) | 1/clock |
 | `global_pool` | per-channel sum over all `H·W` beats → one beat | 1 input beat/clock |
 | `flatten` | collects `H·W` beats into one `(1, 1, H·W·C)` beat | 1 input beat/clock |
 | `lut` | elementwise table lookup (any activation followed by `Quant`) | 1/clock |
@@ -182,6 +182,12 @@ with the `pipeline` options).  Otherwise the unit is folded:
   synthesis fill each block's internal registers.  `pipeline=True` uses K = 3
   for these products, which brings MNIST to 176 MHz (parallel) and 179 MHz
   (folded).  4 registers give nothing more.
+* Pool tree.  `pool` reduces each channel's window with a balanced max /
+  sum tree (`ceil(log2 K)` levels instead of a chain of `K - 1`).  The
+  `"pool"` pipeline stage registers it halfway when the tree has 2 or more
+  levels.  The sums wrap at the tree width like the chain did, so results are
+  unchanged.  On the folded MNIST this removes the last path over 5 ns:
+  179 → 214 MHz.
 
 The user passes `folding={"linear_0": (PE, SIMD), ...}` to `convert` /
 `simulate`.  Layers not listed stay fully parallel.  A helper that chooses
@@ -242,9 +248,6 @@ digitalify/
   DSP and the last tree level plus the bias becomes the critical path (5 ns on
   the parallel MNIST, 176 MHz).  Registering the last tree level separately
   would fix it.
-* A comparison / adder tree in `pool`.  With fully pipelined linear stages the
-  sequential max over the window becomes the critical path (7.5 ns on Artix-7;
-  5.5 ns on the folded MNIST, 179 MHz).
 * Padding inside the window generator.  A separate `pad` stage emits
   `Hp·Wp` beats per `H·W` input pixels, so a padded 3×3 convolution on a small
   image runs at `H·W / (Hp·Wp)` of the input rate (64/100 on 8×8).

@@ -18,7 +18,7 @@ live in the same VHDL library.
 Options
 -------
 pipeline
-    Optional registers inside each fully parallel linear stage (see
+    Optional registers inside the linear and pool stages (see
     ``digitalify.operators.base.PIPELINE_STAGES``).
 folding
     ``{node_name: (PE, SIMD)}``: fold those linear stages into matrix-vector

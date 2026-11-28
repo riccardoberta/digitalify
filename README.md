@@ -150,12 +150,17 @@ Vivado 2025.1 out-of-context synthesis, Artix-7 XC7A200T, `pipeline=True`, 784 c
 | Configuration | Activation | LUT | FF | DSP | fmax | Power | Images/s |
 |---|---|---|---|---|---|---|---|
 | fully parallel | multiplier (`thresholds=False`) | 55,139 | 77,920 | 136 | 83 MHz | 3.5 W | 106 k |
-| fully parallel | thresholds on the 4-bit layers (`"auto"`, default) | 52,822 | 77,961 | 40 | 176 MHz | 1.6 W | 224 k |
+| fully parallel | thresholds on the 4-bit layers (`"auto"`, default) | 52,778 | 78,155 | 40 | 176 MHz | 3.2 W ¹ | 224 k |
 | fully parallel | thresholds everywhere (`True`) | 76,206 | 79,622 | 0 | 83 MHz | 3.9 W | 106 k |
-| folded `linear_1` (16, 24), `linear_2` (2, 40) | `"auto"` | 18,128 | 23,503 | 8 | 179 MHz | 0.9 W | 228 k |
+| folded `linear_1` (16, 24), `linear_2` (2, 40) | `"auto"` | 18,086 | 23,700 | 8 | **214 MHz** | 0.9 W | 272 k |
 
 All configurations use 1.5 BRAM (the line buffers).  The `thresholds=False`
 and `True` rows were measured before the `"round"` pipeline stage existed.
+
+¹ Vivado's vectorless estimate, with default toggle rates.  Adding the `pool`
+register moved this figure from 1.6 W to 3.2 W, all of it in `linear_2`,
+whose logic did not change.  Treat these power figures as rough; a real
+figure needs simulation activity (SAIF).
 
 * With the default thresholds, the two BatchNorm layers need no multiplier at
   all.  96 DSPs go away, power halves, and the requantisation is exact.
@@ -173,9 +178,13 @@ and `True` rows were measured before the `"round"` pipeline stage existed.
   (166 → 174 MHz).  The 31 × 33-bit product is a cascade of four DSP48
   blocks.  With `pipeline=True`, it gets three registers, which synthesis moves
   into the cascade.
-* The critical paths now sit elsewhere.  In the parallel design it is the last
-  adder-tree level plus the bias, feeding the DSP input register (5 ns).
-  In the folded design it is the sequential max of `pool_0` (5.5 ns).
+* The max / sum of a `pool` stage is a balanced tree, and `pipeline=True`
+  registers it halfway (`"pool"`).  The 2×2 max-pools were the folded
+  design's critical path (5.5 ns).  With the tree register the folded design
+  meets a 5 ns clock: 214 MHz, 272 k images/s.  Its critical path is now the
+  weight ROM → product of `linear_1` (4.7 ns).
+* In the parallel design the critical path is the last adder-tree level plus
+  the bias, feeding the DSP input register (5 ns).
 
 ## Generated hardware
 
@@ -252,6 +261,7 @@ products -[products]- tree level 1 -[tree]- level 2 -[tree]- ... last level
 | `"acc"` | after the last tree level + bias | 1 |
 | `"mult"` / `"mult:K"` | after the requantisation product (K registers), or the threshold comparisons (layers that requantise) | K (threshold comparisons: 1) |
 | `"round"` | after the floor, round-up bit and saturation flags (layers with a multiplier requantisation); the next clock is only a `Y_W`-bit increment and a multiplexer | 1 |
+| `"pool"` | in `pool` stages, halfway through the max / sum tree over the window (windows of 3 or more pixels) | 1 |
 
 `pipeline` takes a stage name, a list of names, or `True` for every stage with the tree registered at every level; the default (`None`) adds nothing. Each register adds one clock of latency; throughput does not change.
 

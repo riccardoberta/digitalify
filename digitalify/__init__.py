@@ -46,7 +46,8 @@ def convert(model, output_dir: str | None = None, name: str | None = None,
         every level / every K levels), ``"acc"`` (after the adder tree +
         bias), ``"mult"`` (after the requantisation product, or the threshold
         comparisons), ``"round"`` (after the rounding decision: floor, round-up
-        bit and saturation flags); ``True`` for
+        bit and saturation flags), and inside pool stages ``"pool"`` (halfway
+        through the max / sum tree over the window); ``True`` for
         all of them.  Default: none (one register per layer).  Each
         register adds one clock of latency and shortens the critical path.
     folding : dict, optional

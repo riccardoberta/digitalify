@@ -22,8 +22,7 @@ from dataclasses import dataclass
 from digitalify.ir.node import IRNode
 from digitalify.ir.types import IntType
 
-#: Optional pipeline registers inside a fully parallel ``linear`` stage, in
-#: data-flow order:
+#: Optional pipeline registers inside ``linear`` stages, in data-flow order:
 #:   "products" — after the products x·w (before the adder tree)
 #:   "tree"     — inside the adder tree, every ``tree_every`` levels
 #:                ("tree:2" = every 2 levels; plain "tree" = every level)
@@ -34,7 +33,10 @@ from digitalify.ir.types import IntType
 #:                with ``pipeline=True``, 3 for such products and 1 otherwise
 #:   "round"    — after the floor, round-up and saturation decisions (before the
 #:                final Y_W-bit increment and clipping multiplexer)
-PIPELINE_STAGES = ("products", "tree", "acc", "mult", "round")
+#: and inside ``pool`` stages:
+#:   "pool"     — halfway through the comparison / adder tree over the window
+#:                (windows of 3 or more pixels)
+PIPELINE_STAGES = ("products", "tree", "acc", "mult", "round", "pool")
 
 
 @dataclass(frozen=True)

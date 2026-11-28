@@ -156,53 +156,102 @@ class PoolOperator(VHDLOperator):
     """Handler for ``pool`` IRNodes (per-channel max / sum over a window beat)."""
 
     def describe(self, node: IRNode) -> str:
-        return f"{node.attrs['mode']} over {node.attrs['window']} pixels"
+        reg = ", tree register" if self._cut(node) else ""
+        return f"{node.attrs['mode']} over {node.attrs['window']} pixels{reg}"
+
+    @staticmethod
+    def _sizes(k: int) -> list[int]:
+        """Values per tree level: k, ceil(k/2), ..., 1."""
+        sizes = [k]
+        while sizes[-1] > 1:
+            sizes.append((sizes[-1] + 1) // 2)
+        return sizes
+
+    def _cut(self, node: IRNode) -> int:
+        """Tree level after which the "pool" register sits (0: none).  Only
+        trees of depth 2 or more are cut, halfway."""
+        depth = len(self._sizes(int(node.attrs["window"]))) - 1
+        return (depth + 1) // 2 if "pool" in self.pipeline and depth >= 2 else 0
+
+    def node_latency(self, node: IRNode) -> int:
+        return 1 + bool(self._cut(node))
+
+    @staticmethod
+    def _level(n: int, mode: str, indent: str) -> list[str]:
+        """One balanced tree level, in place on variable t: n values -> ceil(n/2)."""
+        lines = []
+        for i in range(n // 2):
+            a, b = f"t({2 * i})", f"t({2 * i + 1})"
+            if mode == "max":
+                lines.append(f"if {b} > {a} then t({i}) := {b}; else t({i}) := {a}; end if;")
+            else:
+                lines.append(f"t({i}) := {a} + {b};")
+        if n % 2:
+            lines.append(f"t({n // 2}) := t({n - 1});")
+        return [indent + line for line in lines]
 
     def core(self, node: IRNode) -> tuple[list[str], str]:
+        """Per channel, a balanced max / sum tree over the K window pixels
+        (ceil(log2 K) comparator or adder levels instead of K - 1 in a
+        chain), optionally registered halfway ("pool").  The sums wrap at
+        the tree width like the chain did, so the result is unchanged."""
         k = int(node.attrs["window"])
         ch = node.out_features
         xb = node.input_dtype.bits
         yb = node.output_dtype.bits
         vw = max(xb, yb) + 1
-        load = lambda idx: self.load_element(node.input_dtype, "in_data", idx, "v")  # noqa: E731
-        if node.attrs["mode"] == "max":
-            red = "if v > m then m := v; end if;"
-        else:
-            red = "m := m + v;"
-        stmts = [
-            f"                for c in 0 to {ch - 1} loop",
-            f"                    {load('c')}",
-            f"                    m := resize(v, {vw});",
-            f"                    for k in 1 to {k - 1} loop",
-            f"                        {load(f'k * {ch} + c')}",
-            f"                        {red}",
-            "                    end loop;",
-            f"                    {self.element('core_data', 'c', yb)} <= std_logic_vector(m({yb - 1} downto 0));",
-            "                end loop;",
-        ] if k > 1 else [
-            f"                for c in 0 to {ch - 1} loop",
-            f"                    {load('c')}",
-            f"                    m := resize(v, {vw});",
-            f"                    {self.element('core_data', 'c', yb)} <= std_logic_vector(m({yb - 1} downto 0));",
-            "                end loop;",
-        ]
+        mode = node.attrs["mode"]
+        sizes = self._sizes(k)
+        depth = len(sizes) - 1
+        cut = self._cut(node)
+        ind = " " * 20
+        out = f"{ind}{self.element('core_data', 'c', yb)} <= std_logic_vector(t(0)({yb - 1} downto 0));"
+
+        decl = [f"    type tree_t is array(0 to {k - 1}) of signed({vw - 1} downto 0);"]
+        load = [f"{ind}for i in 0 to {k - 1} loop",
+                f"{ind}    {self.load_element(node.input_dtype, 'in_data', f'i * {ch} + c', 'v')}",
+                f"{ind}    t(i) := resize(v, {vw});",
+                f"{ind}end loop;"]
+        first = load + [line for lvl in range(1, (cut or depth) + 1)
+                        for line in self._level(sizes[lvl - 1], mode, ind)]
         variables = (f"        variable v : signed({xb} downto 0);\n"
-                     f"        variable m : signed({vw - 1} downto 0);\n")
-        body = (
-            "    in_ready <= ce;\n\n"
-            "    pool : process(clk)\n" + variables +
-            "    begin\n"
-            "        if rising_edge(clk) then\n"
-            "            if rst = '1' then\n"
-            "                core_valid <= '0';\n"
-            "            elsif ce = '1' then\n"
-            "                core_valid <= in_valid;\n"
-            + "\n".join(stmts) + "\n"
-            "            end if;\n"
-            "        end if;\n"
-            "    end process pool;\n\n"
-        )
-        return [], body
+                     "        variable t : tree_t;\n")
+
+        def process(label: str, valid_out: str, valid_in: str, stmts: list[str], var: str) -> str:
+            return (
+                f"    {label} : process(clk)\n" + var +
+                "    begin\n"
+                "        if rising_edge(clk) then\n"
+                "            if rst = '1' then\n"
+                f"                {valid_out} <= '0';\n"
+                "            elsif ce = '1' then\n"
+                f"                {valid_out} <= {valid_in};\n"
+                f"                for c in 0 to {ch - 1} loop\n"
+                + "\n".join(stmts) + "\n"
+                "                end loop;\n"
+                "            end if;\n"
+                "        end if;\n"
+                f"    end process {label};\n\n"
+            )
+
+        body = "    in_ready <= ce;\n\n"
+        if not cut:
+            body += process("pool", "core_valid", "in_valid", first + [out], variables)
+            return decl, body
+        n_mid = sizes[cut]
+        decl += [f"    type mid_t is array(0 to {ch - 1}, 0 to {n_mid - 1}) of signed({vw - 1} downto 0);",
+                 "    signal mid_r   : mid_t;",
+                 "    signal valid_m : std_logic := '0';"]
+        body += f"    -- Pipeline register after tree level {cut} of {depth}\n"
+        body += process("pool_reg", "valid_m", "in_valid",
+                        first + [f"{ind}for i in 0 to {n_mid - 1} loop mid_r(c, i) <= t(i); end loop;"],
+                        variables)
+        second = [f"{ind}for i in 0 to {n_mid - 1} loop t(i) := mid_r(c, i); end loop;"]
+        second += [line for lvl in range(cut + 1, depth + 1)
+                   for line in self._level(sizes[lvl - 1], mode, ind)]
+        body += process("pool", "core_valid", "valid_m", second + [out],
+                        "        variable t : tree_t;\n")
+        return decl, body
 
 
 class GlobalPoolOperator(VHDLOperator):
