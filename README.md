@@ -150,9 +150,9 @@ Vivado 2025.1 out-of-context synthesis, Artix-7 XC7A200T, `pipeline=True`, 784 c
 | Configuration | Activation | LUT | FF | DSP | fmax | Power | Images/s |
 |---|---|---|---|---|---|---|---|
 | fully parallel | multiplier (`thresholds=False`) | 55,139 | 77,920 | 136 | 83 MHz | 3.5 W | 106 k |
-| fully parallel | thresholds on the 4-bit layers (`"auto"`, default) | 53,444 | 77,967 | 40 | 174 MHz | 1.6 W | 222 k |
+| fully parallel | thresholds on the 4-bit layers (`"auto"`, default) | 52,822 | 77,961 | 40 | 176 MHz | 1.6 W | 224 k |
 | fully parallel | thresholds everywhere (`True`) | 76,206 | 79,622 | 0 | 83 MHz | 3.9 W | 106 k |
-| folded `linear_1` (16, 24), `linear_2` (2, 40) | `"auto"` | 18,182 | 23,469 | 8 | 174 MHz | 0.9 W | 222 k |
+| folded `linear_1` (16, 24), `linear_2` (2, 40) | `"auto"` | 18,128 | 23,503 | 8 | 179 MHz | 0.9 W | 228 k |
 
 All configurations use 1.5 BRAM (the line buffers).  The `thresholds=False`
 and `True` rows were measured before the `"round"` pipeline stage existed.
@@ -170,8 +170,12 @@ and `True` rows were measured before the `"round"` pipeline stage existed.
   took one clock.  The `"round"` stage splits them.  The round-up bit comes
   from a guard bit and an OR of the sticky bits, and the saturation flags
   compare only the floor's significant bits, so no wide carry chain is left
-  (166 → 174 MHz).  The critical path is now the 31 × 33-bit product itself,
-  a cascade of four DSP48 without internal registers (4.3 ns).
+  (166 → 174 MHz).  The 31 × 33-bit product is a cascade of four DSP48
+  blocks.  With `pipeline=True`, it gets three registers, which synthesis moves
+  into the cascade.
+* The critical paths now sit elsewhere.  In the parallel design it is the last
+  adder-tree level plus the bias, feeding the DSP input register (5 ns).
+  In the folded design it is the sequential max of `pool_0` (5.5 ns).
 
 ## Generated hardware
 
@@ -246,10 +250,12 @@ products -[products]- tree level 1 -[tree]- level 2 -[tree]- ... last level
 | `"products"` | after the products x·w | 1 |
 | `"tree"` / `"tree:K"` | inside the adder tree, every level / every K levels (never after the last level) | ⌈depth / K⌉ − 1, depth = ⌈log2(IN_F)⌉ |
 | `"acc"` | after the last tree level + bias | 1 |
-| `"mult"` | after the requantisation product, or the threshold comparisons (layers that requantise) | 1 |
+| `"mult"` / `"mult:K"` | after the requantisation product (K registers), or the threshold comparisons (layers that requantise) | K (threshold comparisons: 1) |
 | `"round"` | after the floor, round-up bit and saturation flags (layers with a multiplier requantisation); the next clock is only a `Y_W`-bit increment and a multiplexer | 1 |
 
 `pipeline` takes a stage name, a list of names, or `True` for every stage with the tree registered at every level; the default (`None`) adds nothing. Each register adds one clock of latency; throughput does not change.
+
+A requantisation product wider than one DSP multiplier (25 × 18) becomes a cascade of DSP blocks.  `"mult:K"` places K registers after it, and the synthesiser moves them into the cascade.  `True` uses K = 3 for such products and 1 otherwise.
 
 Folded stages get the same registers on their datapath (the tree is the `SIMD`-input tree, and the accumulator sits between the tree and `"acc"`). In folded stages `"products"` also registers the weight-ROM word with its input slice, so it adds 2 clocks:
 

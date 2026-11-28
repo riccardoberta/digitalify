@@ -28,7 +28,10 @@ from digitalify.ir.types import IntType
 #:   "tree"     — inside the adder tree, every ``tree_every`` levels
 #:                ("tree:2" = every 2 levels; plain "tree" = every level)
 #:   "acc"      — after the adder tree + bias (before ReLU / requantisation)
-#:   "mult"     — after the requantisation product ``acc · MULT`` (before rounding)
+#:   "mult"     — after the requantisation product ``acc · MULT`` (before rounding);
+#:                "mult:K" = K registers, so synthesis can pipeline a product
+#:                that spans several DSP blocks (threshold comparisons keep one);
+#:                with ``pipeline=True``, 3 for such products and 1 otherwise
 #:   "round"    — after the floor, round-up and saturation decisions (before the
 #:                final Y_W-bit increment and clipping multiplexer)
 PIPELINE_STAGES = ("products", "tree", "acc", "mult", "round")
@@ -40,6 +43,7 @@ class Pipeline:
 
     stages: frozenset = frozenset()
     tree_every: int = 1
+    mult_depth: int | None = 1          # None: automatic (pipeline=True)
 
     def __contains__(self, stage: str) -> bool:
         return stage in self.stages
@@ -51,38 +55,44 @@ class Pipeline:
         names = []
         for st in PIPELINE_STAGES:
             if st in self.stages:
-                names.append(f"tree:{self.tree_every}" if st == "tree" else st)
+                names.append(f"tree:{self.tree_every}" if st == "tree"
+                             else f"mult:{self.mult_depth}" if st == "mult" and (self.mult_depth or 1) > 1
+                             else st)
         return ", ".join(names)
 
 
 def normalize_pipeline(pipeline) -> Pipeline:
     """
     ``None`` / ``False`` → no extra registers; ``True`` → every stage, the
-    adder tree registered at every level; a stage name or an iterable of
-    names (``"tree:K"`` for a register every K tree levels) → those stages.
+    adder tree registered at every level, 3 product registers where the
+    requantisation product needs several DSP blocks; a stage name or an iterable of
+    names (``"tree:K"`` for a register every K tree levels, ``"mult:K"`` for
+    K registers on the requantisation product) → those stages.
     """
     if isinstance(pipeline, Pipeline):
         return pipeline
     if pipeline is None or pipeline is False:
         return Pipeline()
     if pipeline is True:
-        return Pipeline(frozenset(PIPELINE_STAGES), 1)
+        return Pipeline(frozenset(PIPELINE_STAGES), 1, None)
     items = [pipeline] if isinstance(pipeline, str) else list(pipeline)
-    stages, tree_every, unknown = set(), 1, []
+    stages, unknown = set(), []
+    counts = {"tree": 1, "mult": 1}
     for item in items:
         name, _, arg = str(item).partition(":")
-        if name not in PIPELINE_STAGES or (arg and name != "tree"):
+        if name not in PIPELINE_STAGES or (arg and name not in counts):
             unknown.append(item)
             continue
         if arg:
             if not arg.isdigit() or int(arg) < 1:
-                raise ValueError(f"'{item}': the tree interval must be a positive integer.")
-            tree_every = int(arg)
+                raise ValueError(f"'{item}': the {name} count must be a positive integer.")
+            counts[name] = int(arg)
         stages.add(name)
     if unknown:
         raise ValueError(f"Unknown pipeline stage(s) {unknown}; valid stages are "
-                         f"{list(PIPELINE_STAGES)} ('tree:K' for every K tree levels).")
-    return Pipeline(frozenset(stages), tree_every)
+                         f"{list(PIPELINE_STAGES)} ('tree:K' for every K tree levels, "
+                         f"'mult:K' for K product registers).")
+    return Pipeline(frozenset(stages), counts["tree"], counts["mult"])
 
 
 # VHDL condition under which floor(p / 2^n) is incremented.  The discarded

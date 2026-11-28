@@ -30,7 +30,15 @@ def test_normalize_pipeline(value, stages, every):
     assert normalize_pipeline(p) is p
 
 
-@pytest.mark.parametrize("bad", [["acc", "adder"], "fast", "acc:2", "tree:0", "tree:x"])
+def test_mult_depth():
+    p = normalize_pipeline(["acc", "mult:3"])
+    assert p.stages == {"acc", "mult"} and p.mult_depth == 3
+    assert p.describe() == "acc, mult:3"
+    assert normalize_pipeline("mult").mult_depth == 1
+
+
+@pytest.mark.parametrize("bad", [["acc", "adder"], "fast", "acc:2", "tree:0", "tree:x",
+                                 "mult:0", "round:2"])
 def test_unknown_stage_rejected(bad):
     with pytest.raises(ValueError):
         normalize_pipeline(bad)
@@ -47,6 +55,7 @@ def test_convert_rejects_bad_pipeline():
     (None, 2), ("acc", 4), ("mult", 4), ("products", 4),
     ("tree", 2 + 3 + 2), ("tree:2", 2 + 1 + 1), ("tree:4", 2),
     ("round", 4), (True, 8 + 7),
+    ("mult:3", 2 + 2 * 3), (["acc", "mult:2", "round"], 2 + 2 * 4),
 ])
 def test_latency(ir, pipeline, latency):
     op = LinearOperator(pipeline)
@@ -67,6 +76,7 @@ def test_mult_stage_needs_requantisation():
     assert LinearOperator("mult").node_latency(last) == 1
     # 3 inputs: out + products + 1 tree register (depth 2) + acc; no mult / round
     assert LinearOperator(True).node_latency(last) == 4
+    assert LinearOperator(["acc", "mult:3"]).node_latency(last) == 2
 
 
 def test_registers_only_when_enabled(ir):
@@ -131,3 +141,21 @@ def test_round_stage_matches_reference(mode, pipeline, folding, ghdl):
     assert result.passed, result.summary() + "\n" + result.log[-3000:]
     vhdl = digitalify.convert(ir, pipeline=pipeline, folding=folding)[f"{ir.name}_linear_0.vhd"]
     assert "round_reg" in vhdl
+
+
+@pytest.mark.parametrize("mode", ["ROUND", "HALF_UP", "DOWN"])
+@pytest.mark.parametrize("pipeline, folding", [
+    ("mult:3", None),
+    (["acc", "mult:2", "round"], None),
+    (["mult:3", "round"], {"linear_0": (2, 4), "linear_1": (1, 8)}),
+    ("mult:2", {"linear_0": (8, 2)}),
+])
+def test_delayed_product_matches_reference(mode, pipeline, folding, ghdl):
+    """``mult:K``: K registers on the requantisation product, tags delayed with it."""
+    model = make_mlp([16, 8, 4], act_bits=3, output_bits=4, per_channel=True,
+                     pow2_scales=False, rounding_mode=mode, seed=7)
+    ir = digitalify.from_qonnx(model, thresholds=False)
+    result = digitalify.simulate(ir, n_vectors=24, ghdl_path=ghdl, pipeline=pipeline, folding=folding)
+    assert result.passed, result.summary() + "\n" + result.log[-3000:]
+    vhdl = digitalify.convert(ir, pipeline=pipeline, folding=folding)[f"{ir.name}_linear_0.vhd"]
+    assert "mult_reg1" in vhdl

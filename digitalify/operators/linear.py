@@ -93,7 +93,24 @@ class LinearOperator(VHDLOperator):
         rq = node.attrs.get("requant") is not None
         return (("acc" in self.pipeline)
                 + ("mult" in self.pipeline and (rq or node.attrs.get("thresholds") is not None))
+                + self._extra_product_registers(node)
                 + ("round" in self.pipeline and rq))
+
+    def _extra_product_registers(self, node: IRNode) -> int:
+        """Product registers beyond the first ("mult:K"); requantisation only.
+        Automatic depth (``pipeline=True``): 3 registers when acc · MULT does
+        not fit one 25 x 18 DSP multiplier, so synthesis can pipeline the DSP
+        cascade (MREG / PREG of each block), else 1."""
+        rq = node.attrs.get("requant")
+        if "mult" not in self.pipeline or rq is None:
+            return 0
+        depth = self.pipeline.mult_depth
+        if depth is None:
+            aw = node.attrs["acc_dtype"].bits
+            mb = max(int(m).bit_length() for m in rq["multiplier"]) + 1
+            one_dsp = (aw <= 25 and mb <= 18) or (aw <= 18 and mb <= 25)
+            depth = 1 if one_dsp else 3
+        return depth - 1
 
     def describe(self, node: IRNode) -> str:
         out_f, in_f = node.attrs["weight"].shape
@@ -259,8 +276,16 @@ class LinearOperator(VHDLOperator):
                 "                end loop;",
                 variables="        variable a : signed(ACC_W - 1 downto 0);\n",
             )
-            valid_src = "valid_p"
-            stage = ["                    p    := prod_r(j);"]
+            valid_src, prod = "valid_p", "prod_r"
+            for d in range(1, self._extra_product_registers(node) + 1):
+                decl += [f"    signal prod_r{d}  : wide_t;",
+                         f"    signal valid_p{d} : std_logic := '0';"]
+                body += self._register(
+                    f"mult_reg{d}", f"Pipeline register: requantisation product, delay {d + 1}"
+                    " (lets synthesis pipeline a multi-DSP product)",
+                    f"valid_p{d}", valid_src, f"prod_r{d} <= {prod};")
+                valid_src, prod = f"valid_p{d}", f"prod_r{d}"
+            stage = [f"                    p    := {prod}(j);"]
             variables = "        variable p, q, grd, stk : signed(P_W - 1 downto 0);\n"
             relu_here = False
         else:
@@ -691,12 +716,23 @@ class LinearOperator(VHDLOperator):
                 f"                    j := {fnf} * PE + k;\n"
                 + "".join(f"                    {line}\n" for line in get_a) + load +
                 "                end loop;\n", a_var + j_var)
-            fv, fnf = "p_v", "p_nf"
+            fv, fnf, prod = "p_v", "p_nf", "prod_r"
+            for d in range(1, self._extra_product_registers(node) + 1):
+                decl += [f"    signal p{d}_v  : std_logic := '0';",
+                         f"    signal p{d}_nf : natural range 0 to NF - 1 := 0;",
+                         f"    signal prod_r{d} : pe_wide_t;"]
+                body += clocked(
+                    f"mult_reg{d}", f"Pipeline register: requantisation product, delay {d + 1}"
+                    " (lets synthesis pipeline a multi-DSP product)", f"p{d}_v",
+                    f"                p{d}_v  <= {fv};\n"
+                    f"                p{d}_nf <= {fnf};\n"
+                    f"                prod_r{d} <= {prod};\n")
+                fv, fnf, prod = f"p{d}_v", f"p{d}_nf", f"prod_r{d}"
             if thr:
                 fin = [f"{ind}y := to_signed(THR_BASE(j) + thermo_count(cmp_r(k)), Y_W + 1);",
                        f"{ind}res(k) := std_logic_vector(y(Y_W - 1 downto 0));"]
             else:
-                pre = [f"{ind}p := prod_r(k);"]
+                pre = [f"{ind}p := {prod}(k);"]
         else:
             fin = [ind + line for line in get_a]
             if thr:

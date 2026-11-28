@@ -59,3 +59,14 @@ def test_balanced_folding_keeps_one_pixel_per_clock(ir, ghdl):
                                 folding=folding) for n in (2, 4)]
     assert all(r.passed for r in runs)
     assert runs[1].cycles - runs[0].cycles == 2 * 28 * 28
+
+
+def test_wide_product_gets_three_registers(ir):
+    """pipeline=True: the final layer's 31-bit x 33-bit requantisation product
+    spans several DSP blocks, so it gets 3 registers; the thresholded layers
+    keep one comparison register."""
+    from digitalify.operators.linear import LinearOperator
+    op = LinearOperator(True)
+    extra = {n.name: op._extra_product_registers(n) for n in ir.nodes if n.op_type == "linear"}
+    assert extra == {"linear_0": 0, "linear_1": 0, "linear_2": 2}
+    assert "mult_reg2" in digitalify.convert(ir, pipeline=True)[f"{ir.name}_linear_2.vhd"]

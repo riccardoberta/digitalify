@@ -177,6 +177,11 @@ with the `pipeline` options).  Otherwise the unit is folded:
   and not sticky, `r /= 0` = guard or sticky).  The saturation flags compare
   the floor on its `FL_W = P_W - min(SHIFT)` significant bits.  On the MNIST
   example the 64-bit carry chains go away: 166 → 174 MHz.
+* Wide products (`mult:K`).  A product that does not fit one 25 × 18 DSP
+  multiplier becomes a cascade of DSP blocks.  K registers after it let
+  synthesis fill each block's internal registers.  `pipeline=True` uses K = 3
+  for these products, which brings MNIST to 176 MHz (parallel) and 179 MHz
+  (folded).  4 registers give nothing more.
 
 The user passes `folding={"linear_0": (PE, SIMD), ...}` to `convert` /
 `simulate`.  Layers not listed stay fully parallel.  A helper that chooses
@@ -232,11 +237,14 @@ digitalify/
 * Block-RAM line buffers with synchronous read, for large images (the first
   version uses distributed RAM with asynchronous read).
 * Automatic folding for a target throughput or resource budget.
-* Pipelined wide requantisation multiplier: the 31 × 33-bit product of the
-  final MNIST layer is a cascade of four DSP48 without internal registers
-  (4.3 ns, the critical path at 174 MHz).
+* Bias adder into the DSP input: when a requantisation product follows the
+  `acc` register directly (no ReLU), synthesis absorbs that register into the
+  DSP and the last tree level plus the bias becomes the critical path (5 ns on
+  the parallel MNIST, 176 MHz).  Registering the last tree level separately
+  would fix it.
 * A comparison / adder tree in `pool`.  With fully pipelined linear stages the
-  sequential max over the window becomes the critical path (7.5 ns on Artix-7).
+  sequential max over the window becomes the critical path (7.5 ns on Artix-7;
+  5.5 ns on the folded MNIST, 179 MHz).
 * Padding inside the window generator.  A separate `pad` stage emits
   `Hp·Wp` beats per `H·W` input pixels, so a padded 3×3 convolution on a small
   image runs at `H·W / (Hp·Wp)` of the input rate (64/100 on 8×8).
